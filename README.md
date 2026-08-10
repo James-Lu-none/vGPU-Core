@@ -3,6 +3,15 @@
 ## 專案簡介 (Introduction)
 vGPU-Core 是一個基於 Linux Kernel 的虛擬 PCIe 加速器驅動程式。本專案旨在模擬現代 GPU / AI 加速器在矽前驗證 (Pre-silicon Validation) 階段的軟硬體互動模型。透過實作字元裝置介面、記憶體映射與非同步工作佇列，提供了一個無需實體硬體即可驗證 User-to-Kernel 溝通開銷與排程機制的測試平台。
 
+## build, install and check
+
+```bash
+make
+sudo insmod vgpu_core.ko
+ls -l /dev/vgpu0
+
+sudo rmmod vgpu_core.ko
+```
 
 ## 實體 Linux 系統到 PCIe 的軟硬體架構 (overview)
 

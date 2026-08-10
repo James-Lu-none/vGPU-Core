@@ -34,9 +34,40 @@ static int vgpu_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+static int *global 
+
+static char *msg_Ptr="Hi i am vGPU driver\n";
+static ssize_t vgpu_read(struct file *filp,
+   char *buffer,    /* The buffer to fill with data */
+   size_t length,   /* The length of the buffer     */
+   loff_t *offset)  /* Our offset in the file       */
+{
+   /* Number of bytes actually written to the buffer */
+   int bytes_read = 0;
+
+   /* If we're at the end of the message, return 0 signifying end of file */
+   if (*msg_Ptr == 0) return 0;
+
+   /* Actually put the data into the buffer */
+   while (length && *msg_Ptr)  {
+
+        /* The buffer is in the user data segment, not the kernel segment;
+         * assignment won't work.  We have to use put_user which copies data from
+         * the kernel data segment to the user data segment. */
+         put_user(*(msg_Ptr++), buffer++);
+
+         length--;
+         bytes_read++;
+   }
+
+   /* Most read functions return the number of bytes put into the buffer */
+   return bytes_read;
+}
+
 // 告訴 Kernel 當使用者對 /dev/vgpu0 按下 open()、ioctl() 時，要執行我這裡定義的哪個函數
 static const struct file_operations vgpu_core_fops = {
     .owner   = THIS_MODULE,
+    .read      = vgpu_read,
     .open      = vgpu_open,
     .release   = vgpu_release,
 };
@@ -49,7 +80,7 @@ static int __init vgpu_core_init(void)
 {
     int result;
     pr_info("vGPU-Core: module loaded\n");
-
+    // equivalent to printk(KERN_INFO "vGPU-Core: module loaded\n");
     // 1. alloc 結構體
     g_vgpu_dev = kzalloc(sizeof(struct vgpu_dev), GFP_KERNEL);
     if (!g_vgpu_dev) {
@@ -67,7 +98,7 @@ static int __init vgpu_core_init(void)
         kfree(g_vgpu_dev);
         return result;
     }
-    // 3. 建立 cdev
+    // 3. 建立 cdev (character device)
     cdev_init(&g_vgpu_dev->cdev, &vgpu_core_fops);
     result = cdev_add(&g_vgpu_dev->cdev, g_vgpu_dev->dev, 1);
     if (result < 0) {
@@ -77,17 +108,19 @@ static int __init vgpu_core_init(void)
         return result;
     }
 
-    // 4. 建立 udev (user space device /dev/vgpu0)
+    // 4. 建立 device class
     // 在 Linux 裡，建立 Device 之前，必須先把它歸屬於某個 Class
     // (例如你插上滑鼠，它屬於 input class; 插上網卡，屬於 net class)
-    g_vgpu_class = class_create("vgpu_core");
+    g_vgpu_class = class_create("vgpu_class");
     if (IS_ERR(g_vgpu_class)) {
         pr_err("vGPU-Core: failed to create class\n");
+        class_destroy(g_vgpu_class); 
         cdev_del(&g_vgpu_dev->cdev);
         unregister_chrdev_region(g_vgpu_dev->dev, 1);
         kfree(g_vgpu_dev);
         return PTR_ERR(g_vgpu_class);
     }
+    // 5. 建立 udev (user space device /dev/vgpu0)
     g_vgpu_dev->device = device_create(
         g_vgpu_class, // parent class
         NULL,  
@@ -111,11 +144,13 @@ static int __init vgpu_core_init(void)
 static void __exit vgpu_core_exit(void)
 {
     if (g_vgpu_dev) {
-        // 4. 移除 udev 
+        // 5. 移除 udev 
         device_destroy(
             g_vgpu_class,
             g_vgpu_dev->dev
         );
+        // 4. 移除 class
+        class_destroy(g_vgpu_class);
         // 3. 移除 cdev
         cdev_del(&g_vgpu_dev->cdev);
         // 2. 釋放裝置號碼 (第一個參數是起始裝置號，第二個參數是數量)
