@@ -95,29 +95,22 @@ static int __init vgpu_core_init(void)
     result = alloc_chrdev_region(&g_vgpu_dev->dev, 0, 1, "vgpu_core");
     if (result < 0) {
         pr_err("vGPU-Core: failed to allocate device number\n");
-        kfree(g_vgpu_dev);
-        return result;
+        goto err_alloc_chrdev_region;
     }
     // 3. 建立 cdev (character device)
     cdev_init(&g_vgpu_dev->cdev, &vgpu_core_fops);
     result = cdev_add(&g_vgpu_dev->cdev, g_vgpu_dev->dev, 1);
     if (result < 0) {
-        pr_err("vGPU-Core: failed to add device\n");
-        unregister_chrdev_region(g_vgpu_dev->dev, 1);
-        kfree(g_vgpu_dev);
-        return result;
+        goto err_cdev_add;
     }
 
     // 4. 建立 device class
     // 在 Linux 裡，建立 Device 之前，必須先把它歸屬於某個 Class
-    // (例如你插上滑鼠，它屬於 input class; 插上網卡，屬於 net class)
     g_vgpu_class = class_create("vgpu_class");
     if (IS_ERR(g_vgpu_class)) {
         pr_err("vGPU-Core: failed to create class\n");
-        cdev_del(&g_vgpu_dev->cdev);
-        unregister_chrdev_region(g_vgpu_dev->dev, 1);
-        kfree(g_vgpu_dev);
-        return PTR_ERR(g_vgpu_class);
+        result = PTR_ERR(g_vgpu_class);
+        goto err_class_destroy;
     }
     // 5. 建立 udev (user space device /dev/vgpu0)
     g_vgpu_dev->device = device_create(
@@ -129,14 +122,24 @@ static int __init vgpu_core_init(void)
     );
     if (IS_ERR(g_vgpu_dev->device)) {
         pr_err("vGPU-Core: failed to create device\n");
-        class_destroy(g_vgpu_class); 
-        cdev_del(&g_vgpu_dev->cdev);
-        unregister_chrdev_region(g_vgpu_dev->dev, 1);
-        kfree(g_vgpu_dev);
-        return PTR_ERR(g_vgpu_dev->device);
+        result = PTR_ERR(g_vgpu_dev->device);
+        goto err_device_create;
     }
     pr_info("vGPU-Core: module loaded successfully\n");
-    return 0; 
+    return 0;
+
+// Cascading error cleanup paths
+err_device_create:
+    class_destroy(g_vgpu_class);
+err_class_destroy:
+    cdev_del(&g_vgpu_dev->cdev);
+err_cdev_add:
+    unregister_chrdev_region(g_vgpu_dev->dev, 1);
+err_alloc_chrdev_region:
+    kfree(g_vgpu_dev);
+    
+    return result; // 回傳錯誤碼
+
 }
 
 // 自定義 exitfn
