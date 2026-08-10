@@ -114,7 +114,6 @@ static int __init vgpu_core_init(void)
     g_vgpu_class = class_create("vgpu_class");
     if (IS_ERR(g_vgpu_class)) {
         pr_err("vGPU-Core: failed to create class\n");
-        class_destroy(g_vgpu_class); 
         cdev_del(&g_vgpu_dev->cdev);
         unregister_chrdev_region(g_vgpu_dev->dev, 1);
         kfree(g_vgpu_dev);
@@ -130,6 +129,7 @@ static int __init vgpu_core_init(void)
     );
     if (IS_ERR(g_vgpu_dev->device)) {
         pr_err("vGPU-Core: failed to create device\n");
+        class_destroy(g_vgpu_class); 
         cdev_del(&g_vgpu_dev->cdev);
         unregister_chrdev_region(g_vgpu_dev->dev, 1);
         kfree(g_vgpu_dev);
