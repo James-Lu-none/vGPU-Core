@@ -12,11 +12,34 @@
 // 3. cdev_alloc(), cdev_add(), cdev_del(), cdev_init()
 // https://github.com/torvalds/linux/blob/master/include/linux/cdev.h 
 #include <linux/cdev.h>
+#include <linux/uaccess.h> // for copy_from_user
+#include "vgpu_ioctl.h"
+
+#define QUEUE_SIZE 128
+
+// 架構切換開關 (Module Parameter)
+// 0: Global Shared Queue (Mode A)
+// 1: Private Context Queue (Mode B)
+static int vgpu_mode = 0;
+module_param(vgpu_mode, int, 0444);
+MODULE_PARM_DESC(vgpu_mode, "0: Global Shared Queue (Mode A), 1: Private Context Queue (Mode B)");
 
 struct vgpu_dev {
     dev_t dev;          // 儲存裝置號 (Major/Minor number)
     struct cdev cdev;     // 儲存核心的 cdev 結構
     struct device *device; // 儲存核心的 device 結構
+
+    // 因為這個結構體的生命週期跟硬體一樣長。只要裝置插在主機板上，這個結構體就在
+    // 所以裡面通常會塞所有全域狀態，包含 dev_t, cdev, 暫存器(Registers)的記憶體映射位址 (MMIO base address), IRQ 中斷號碼。
+    // 全域共享資源、控制硬體電源狀態的鎖、全域的 Wait Queue, 排程器 (Scheduler)...
+    // 而如果今天這台機器插了 4 張 vGPU 卡，我們只需要 kzalloc 4 個 struct vgpu_dev 就可以了，每張卡都有自己獨立的 cdev、lock 和 queue，彼此不衝突
+    // 所以把所有的資源都集中在 struct vgpu_dev 結構體裡是 best practice
+
+    /* [Mode A] Global Shared Ring Buffer */
+    struct vgpu_command global_queue[QUEUE_SIZE];
+    int head;
+    int tail;
+    spinlock_t global_lock;
 };
 
 struct vgpu_dev *g_vgpu_dev = NULL; // 全域變數，指向我們建立的裝置結構
@@ -33,8 +56,6 @@ static int vgpu_release(struct inode *inode, struct file *file)
     pr_info("vGPU-Core: release\n");
     return 0;
 }
-
-static int *global 
 
 static char *msg_Ptr="Hi i am vGPU driver\n";
 static ssize_t vgpu_read(struct file *filp,
@@ -64,12 +85,55 @@ static ssize_t vgpu_read(struct file *filp,
    return bytes_read;
 }
 
+static long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct vgpu_command user_cmd;
+    
+    switch (cmd) {
+        case VGPU_IOC_SUBMIT_CMD:
+            // 1. 安全地把 User Space 的資料搬到 Kernel Space
+            if (copy_from_user(&user_cmd, (struct vgpu_command __user *)arg, sizeof(user_cmd))) {
+                return -EFAULT; // 存取錯誤，可能是非法記憶體位址
+            }
+
+            if (vgpu_mode == 0) {
+                // [Mode A] Global Queue，需要上鎖保護
+                spin_lock(&g_vgpu_dev->global_lock);
+                g_vgpu_dev->global_queue[g_vgpu_dev->tail] = user_cmd;
+                g_vgpu_dev->tail = (g_vgpu_dev->tail + 1) % QUEUE_SIZE;
+                
+                pr_info("vGPU-Core: [Mode A] Received command: opcode=%u, op1=%u, op2=%u. Queue Tail: %d\n",
+                        user_cmd.opcode, user_cmd.operand1, user_cmd.operand2, g_vgpu_dev->tail);
+                // 釋放lock
+                spin_unlock(&g_vgpu_dev->global_lock);
+            } else {
+                pr_info("vGPU-Core: [Mode B] Not implemented yet.\n");
+            }
+            break;
+
+        case VGPU_IOC_DOORBELL:
+            pr_info("vGPU-Core: Doorbell Rung! Hardware is starting to process commands...\n");
+            // TODO: process data
+            break;
+
+        default:
+            return -ENOTTY;
+    }
+    
+    return 0;
+}
+
 // 告訴 Kernel 當使用者對 /dev/vgpu0 按下 open()、ioctl() 時，要執行我這裡定義的哪個函數
 static const struct file_operations vgpu_core_fops = {
-    .owner   = THIS_MODULE,
-    .read      = vgpu_read,
-    .open      = vgpu_open,
-    .release   = vgpu_release,
+    .owner          = THIS_MODULE,
+    .read           = vgpu_read,
+    .open           = vgpu_open,
+    .release        = vgpu_release,
+    // .ioctl was removed in kernel version 2.6.39, which is slower since it uses BKL. 
+    // ioctl是舊時代使用BKL的kernel function, 現在使用 unlocked_ioctl 的意思是
+    // 我不需要 kernel 幫我拿大鎖來保護 vgpu_dev 資料結構裡的數據
+    // 而是開發者要自己想辦法用正確的鎖來保護我自己的數據
+    .unlocked_ioctl = vgpu_ioctl,
 };
 
 
@@ -87,6 +151,12 @@ static int __init vgpu_core_init(void)
         pr_err("vGPU-Core: failed to allocate device structure\n");
         return -ENOMEM;
     }
+    
+    // 初始化 Global Ring Buffer 與 Lock (Mode A)
+    spin_lock_init(&g_vgpu_dev->global_lock);
+    g_vgpu_dev->head = 0;
+    g_vgpu_dev->tail = 0;
+
     // 2. 取得裝置號
     // 0 means base number, 1 means number of devices
     // -> /dev/vgpu_core0

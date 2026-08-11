@@ -1,10 +1,15 @@
 obj-m += vgpu_core.o
 
+
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
-all:
+all: user_program
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+user_program:
+	gcc test_ioctl.c -o test_ioctl
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f test_ioctl

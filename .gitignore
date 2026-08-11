@@ -36,3 +36,6 @@ Module.symvers
 .idea/
 *.swp
 *~
+
+# tests
+test_ioctl
