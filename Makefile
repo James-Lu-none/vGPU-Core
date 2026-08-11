@@ -9,7 +9,8 @@ all: user_program
 
 user_program:
 	gcc test_ioctl.c -o test_ioctl -pthread
+	gcc test_mmap.c -o test_mmap
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f test_ioctl
+	rm -f test_ioctl test_mmap

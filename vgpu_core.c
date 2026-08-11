@@ -13,6 +13,10 @@
 // https://github.com/torvalds/linux/blob/master/include/linux/cdev.h 
 #include <linux/cdev.h>
 #include <linux/uaccess.h> // for copy_from_user
+// simulate platform_device
+#include <linux/platform_device.h>
+#include <linux/dma-mapping.h>
+#include <linux/mm.h>
 
 #include <linux/list.h> // Intrusive Doubly Linked List for context
 
@@ -20,12 +24,15 @@
 
 #define QUEUE_SIZE 128
 
-// 架構切換開關 (Module Parameter)
-// 0: Global Shared Queue (Mode A)
-// 1: Private Context Queue (Mode B)
-static int vgpu_mode = 0;
-module_param(vgpu_mode, int, 0444);
-MODULE_PARM_DESC(vgpu_mode, "0: Global Shared Queue (Mode A), 1: Private Context Queue (Mode B)");
+// Queue 架構切換開關 (Module Parameter)
+static int queue_mode = 0;
+module_param(queue_mode, int, 0444);
+MODULE_PARM_DESC(queue_mode, "0: Global Shared Queue, 1: Private Context Queue");
+
+// DMA 架構切換開關 (Module Parameter)
+static int dma_mode = 0;
+module_param(dma_mode, int, 0444);
+MODULE_PARM_DESC(dma_mode, "0: Software Pages MMAP, 1: DMA Platform Device MMAP");
 
 struct vgpu_context {
     struct vgpu_command private_queue[QUEUE_SIZE];
@@ -34,10 +41,15 @@ struct vgpu_context {
     struct list_head list_node; // 這是用來串接在 vgpu_dev->ctx_list 上面的節點
 };
 
+
+
 struct vgpu_dev {
     dev_t dev;          // 儲存裝置號 (Major/Minor number)
     struct cdev cdev;     // 儲存核心的 cdev 結構
     struct device *device; // 儲存核心的 device 結構
+    
+    // 虛擬硬體：Platform Device (用於 Mode B 的 DMA API)
+    struct platform_device *pdev;
 
     // 因為這個結構體的生命週期跟硬體一樣長。只要裝置插在主機板上，這個結構體就在
     // 所以裡面通常會塞所有全域狀態，包含 dev_t, cdev, 暫存器(Registers)的記憶體映射位址 (MMIO base address), IRQ 中斷號碼。
@@ -45,15 +57,19 @@ struct vgpu_dev {
     // 而如果今天這台機器插了 4 張 vGPU 卡，我們只需要 kzalloc 4 個 struct vgpu_dev 就可以了，每張卡都有自己獨立的 cdev、lock 和 queue，彼此不衝突
     // 所以把所有的資源都集中在 struct vgpu_dev 結構體裡是 best practice
 
-    /* [Mode A] Global Shared Ring Buffer */
+    /* Global Shared Ring Buffer */
     struct vgpu_command global_queue[QUEUE_SIZE];
     int head;
     int tail;
     spinlock_t global_lock;
 
-    /* [Mode B] Private Context Queue (Single Process Single Context) */
+    /* Private Context Queue (Single Process Single Context) */
     struct list_head ctx_list; // 這是清單的「頭」
     spinlock_t ctx_lock;       // 保護這個清單的鎖
+
+    /* Zero-Copy MMAP Buffer */
+    void *data_buffer;         // Kernel 虛擬位址
+    dma_addr_t dma_handle;     // Mode B (DMA API) 使用的匯流排實體位址
 };
 
 struct vgpu_dev *g_vgpu_dev = NULL; // 全域變數，指向我們建立的裝置結構
@@ -62,7 +78,7 @@ struct class *g_vgpu_class = NULL;
 static int vgpu_open(struct inode *inode, struct file *file)
 {
     pr_info("vGPU-Core: open\n");
-    if (vgpu_mode == 0){
+    if (queue_mode == 0){
         pr_info("vGPU-Core: Global Shared Queue (Mode A), skip context allocate\n");
     } else {
         pr_info("vGPU-Core: Private Context Queue (Mode B), start to allocate context\n");
@@ -87,7 +103,7 @@ static int vgpu_open(struct inode *inode, struct file *file)
 static int vgpu_release(struct inode *inode, struct file *file)
 {
     pr_info("vGPU-Core: release\n");
-    if (vgpu_mode == 0){
+    if (queue_mode == 0){
         pr_info("vGPU-Core: Global Shared Queue (Mode A), skip context allocate\n");
     } else {
         pr_info("vGPU-Core: Private Context Queue (Mode B), start to release context\n");
@@ -143,32 +159,35 @@ static long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 return -EFAULT; // 存取錯誤，可能是非法記憶體位址
             }
 
-            if (vgpu_mode == 0) {
-                // [Mode A] Global Queue，需要上鎖保護
+            if (queue_mode == 0) {
+                // Global Queue，需要上鎖保護
                 spin_lock(&g_vgpu_dev->global_lock);
                 g_vgpu_dev->global_queue[g_vgpu_dev->tail] = user_cmd;
                 g_vgpu_dev->tail = (g_vgpu_dev->tail + 1) % QUEUE_SIZE;
                 
-                // pr_info("vGPU-Core: [Mode A] Received command: opcode=%u, op1=%u, op2=%u. Queue Tail: %d\n",
+                // pr_info("vGPU-Core: Received command: opcode=%u, op1=%u, op2=%u. Queue Tail: %d\n",
                 //        user_cmd.opcode, user_cmd.operand1, user_cmd.operand2, g_vgpu_dev->tail);
                 // 釋放lock
                 spin_unlock(&g_vgpu_dev->global_lock);
             } else {
-                // [Mode B] 從 private_data 取出專屬 Queue，直接寫入 (Lock-free!)
+                // 從 private_data 取出專屬 Queue，直接寫入 (Lock-free!)
                 struct vgpu_context *ctx = file->private_data;
                 if (!ctx) return -EFAULT;
                 
                 ctx->private_queue[ctx->tail] = user_cmd;
                 ctx->tail = (ctx->tail + 1) % QUEUE_SIZE;
                 
-                // pr_info("vGPU-Core: [Mode B] Received command: opcode=%u. Private Tail: %d\n",
+                // pr_info("vGPU-Core: Received command: opcode=%u. Private Tail: %d\n",
                 //        user_cmd.opcode, ctx->tail);
             }
             break;
 
         case VGPU_IOC_DOORBELL:
             pr_info("vGPU-Core: Doorbell Rung! Hardware is starting to process commands...\n");
-            if (vgpu_mode == 1) {
+            if (g_vgpu_dev->data_buffer) {
+                pr_info("vGPU-Core: [Data Path] GPU reading Data Buffer: '%s'\n", (char *)g_vgpu_dev->data_buffer);
+            }
+            if (queue_mode == 1) {
                 struct vgpu_context *ctx;
                 int count = 0;
                 
@@ -190,12 +209,37 @@ static long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     return 0;
 }
 
+static int vgpu_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    unsigned long size = vma->vm_end - vma->vm_start;
+    
+    if (size > PAGE_SIZE) return -EINVAL; // 為了示範，我們只映射 1 個 Page (4KB)
+    
+    if (dma_mode == 1) {
+        // 使用 DMA API 提供的 mmap
+        pr_info("vGPU-Core: mmap via dma_mmap_coherent\n");
+        return dma_mmap_coherent(&g_vgpu_dev->pdev->dev, vma, 
+                                 g_vgpu_dev->data_buffer, 
+                                 g_vgpu_dev->dma_handle, size);
+    } else {
+        // 純軟體模擬，使用 remap_pfn_range
+        unsigned long pfn;
+        pr_info("vGPU-Core: mmap via remap_pfn_range\n");
+        
+        // 取得 Kernel 虛擬位址對應的 實體記憶體 PFN (Page Frame Number)
+        pfn = virt_to_phys(g_vgpu_dev->data_buffer) >> PAGE_SHIFT;
+        
+        return remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
+    }
+}
+
 // 告訴 Kernel 當使用者對 /dev/vgpu0 按下 open()、ioctl() 時，要執行我這裡定義的哪個函數
 static const struct file_operations vgpu_core_fops = {
     .owner          = THIS_MODULE,
     .read           = vgpu_read,
     .open           = vgpu_open,
     .release        = vgpu_release,
+    .mmap           = vgpu_mmap,
     // .ioctl was removed in kernel version 2.6.39, which is slower since it uses BKL. 
     // ioctl是舊時代使用BKL的kernel function, 現在使用 unlocked_ioctl 的意思是
     // 我不需要 kernel 幫我拿大鎖來保護 vgpu_dev 資料結構裡的數據
@@ -265,6 +309,43 @@ static int __init vgpu_core_init(void)
         result = PTR_ERR(g_vgpu_dev->device);
         goto err_device_create;
     }
+    // 6. 分配 Zero-Copy MMAP 的 Data Buffer
+    if (dma_mode == 1) {
+        // 建立虛擬的 Platform Device (模擬掛在匯流排上的實體硬體)
+        g_vgpu_dev->pdev = platform_device_register_simple("vgpu_device", -1, NULL, 0);
+        if (IS_ERR(g_vgpu_dev->pdev)) {
+            pr_err("vGPU-Core: failed to register platform device\n");
+            result = PTR_ERR(g_vgpu_dev->pdev);
+            platform_device_unregister(g_vgpu_dev->pdev);
+            goto err_device_create;
+        }
+        
+        // 設定 DMA 遮罩，告訴 Kernel 這個 device 支援 64-bit 定址
+        dma_set_mask_and_coherent(&g_vgpu_dev->pdev->dev, DMA_BIT_MASK(64));
+        
+        // 呼叫 DMA API 分配具備快取一致性的實體連續記憶體
+        g_vgpu_dev->data_buffer = dma_alloc_coherent(&g_vgpu_dev->pdev->dev, PAGE_SIZE, 
+                                                     &g_vgpu_dev->dma_handle, GFP_KERNEL);
+        if (!g_vgpu_dev->data_buffer) {
+            pr_err("vGPU-Core: failed to allocate DMA memory\n");
+            result = -ENOMEM;
+            platform_device_unregister(g_vgpu_dev->pdev);
+            goto err_device_create;
+        }
+        pr_info("vGPU-Core: Allocated DMA buffer at %p (bus addr: %llx)\n", 
+                g_vgpu_dev->data_buffer, (unsigned long long)g_vgpu_dev->dma_handle);
+    } else {
+        // 純軟體模擬，直接向 Buddy System 要實體連續記憶體
+        g_vgpu_dev->data_buffer = (void *)__get_free_pages(GFP_KERNEL, 0);
+        if (!g_vgpu_dev->data_buffer) {
+            pr_err("vGPU-Core: failed to allocate pages\n");
+            result = -ENOMEM;
+            goto err_device_create;
+        }
+        pr_info("vGPU-Core: Allocated pure software page buffer at %p\n", 
+                g_vgpu_dev->data_buffer);
+    }
+
     pr_info("vGPU-Core: module loaded successfully\n");
     return 0;
 
@@ -287,6 +368,20 @@ err_alloc_chrdev_region:
 static void __exit vgpu_core_exit(void)
 {
     if (g_vgpu_dev) {
+        // 6. 釋放 MMAP Data Buffer
+        if (dma_mode == 1) {
+            if (g_vgpu_dev->data_buffer) {
+                dma_free_coherent(&g_vgpu_dev->pdev->dev, PAGE_SIZE, g_vgpu_dev->data_buffer, g_vgpu_dev->dma_handle);
+            }
+            if (g_vgpu_dev->pdev) {
+                platform_device_unregister(g_vgpu_dev->pdev);
+            }
+        } else {
+            if (g_vgpu_dev->data_buffer) {
+                free_pages((unsigned long)g_vgpu_dev->data_buffer, 0);
+            }
+        }
+
         // 5. 移除 udev 
         device_destroy(
             g_vgpu_class,

@@ -9,29 +9,39 @@ vGPU-Core 是一個基於 Linux Kernel 的虛擬 PCIe 加速器驅動程式。�
 make clean
 make
 
+# global queue + spin_lock vs private queue per context
 sudo rmmod vgpu_core
-sudo insmod vgpu_core.ko vgpu_mode=0
+sudo insmod vgpu_core.ko queue_mode=0 dma_mode=0
 sudo ./test_ioctl
 
 sudo rmmod vgpu_core
-sudo insmod vgpu_core.ko vgpu_mode=1
+sudo insmod vgpu_core.ko queue_mode=1 dma_mode=0
 sudo ./test_ioctl
+
+# remap_pfn_range vs dma
+sudo rmmod vgpu_core
+sudo insmod vgpu_core.ko queue_mode=1 dma_mode=0
+sudo ./test_mmap
+
+sudo rmmod vgpu_core
+sudo insmod vgpu_core.ko queue_mode=1 dma_mode=1
+sudo ./test_mmap
 ```
 
 ## 實體gpu運作模式與vGPU運作比較
 
 1. 實體 GPU 運作模式 (Zero-Copy 架構)
 
-- **[Data Path]** User space 透過 `mmap()` 向驅動程式請求記憶體映射，驅動分配一塊 DMA Buffer 並直接映射給 User space。
-- **[Data Path]** User space 將要運算的巨量資料（如神經網路權重）直接寫入該映射位址，無需透過 `copy_from_user`。
-- **[Control Path]** 驅動程式在記憶體中維護 Ring Buffer，並將其實體位址告知 GPU 硬體。
-- **[Control Path]** User space 透過 `ioctl` (或 MMIO) 將「運算指令 (Command)」寫入 Ring Buffer。
-- **[Control Path]** 驅動程式更新 Ring Buffer 的 Tail Pointer，並寫入 GPU 的 Doorbell 暫存器通知硬體。
-- **[Hardware]** GPU 的 Command Processor 讀取 Ring Buffer 裡的指令。
-- **[Hardware]** GPU 根據指令，透過 PCIe DMA 直接讀取 Data Buffer 進行運算，並將結果直接寫回 Data Buffer。
-- **[Hardware]** GPU 運算完畢，發出硬體中斷 (IRQ / MSI-X)。
-- **[Synchronization]** Kernel Driver 攔截中斷，喚醒在 Wait Queue 中等待的 User space 執行緒。
-- **[Result]** User space 被喚醒後，直接從 mmap 的位址讀取運算結果，達成真正的 Zero-Copy。
+- **[Data Path]** User space 透過 `mmap()` 向驅動程式請求記憶體映射，驅動分配一塊 DMA Buffer 並直接映射給 User space
+- **[Data Path]** User space 將要運算的資料直接寫入該映射位址
+- **[Control Path]** 驅動程式在記憶體中維護 Ring Buffer，並將其實體位址告知 GPU 硬體
+- **[Control Path]** User space 透過 `ioctl` 將運算指令寫入 Ring Buffer
+- **[Control Path]** 驅動程式更新 Ring Buffer 的 Tail Pointer，並寫入 GPU 的 Doorbell 暫存器通知硬體
+- **[Hardware]** GPU 的 Command Processor 讀取 Ring Buffer 裡的指令
+- **[Hardware]** GPU 根據指令，透過 PCIe DMA 直接讀取 Data Buffer 進行運算，並將結果直接寫回 Data Buffer
+- **[Hardware]** GPU 運算完畢，發出硬體中斷 (IRQ / MSI-X)
+- **[Synchronization]** Kernel Driver 攔截中斷，喚醒在 Wait Queue 中等待的 User space 執行緒
+- **[Result]** User space 被喚醒後從 mmap 的位址讀取運算結果
 
 ## 實體 Linux 系統到 PCIe 的軟硬體架構 (overview)
 
