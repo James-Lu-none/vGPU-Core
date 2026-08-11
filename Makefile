@@ -1,17 +1,11 @@
-obj-m += vgpu_core.o
+all: driver_module user_tests
 
+driver_module:
+	$(MAKE) -C driver/
 
-KDIR := /lib/modules/$(shell uname -r)/build
-PWD := $(shell pwd)
-
-all: user_program
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
-
-user_program:
-	gcc test_ioctl.c -o test_ioctl -pthread
-	gcc test_mmap.c -o test_mmap
-	gcc test_interrupt.c -o test_interrupt
+user_tests:
+	$(MAKE) -C tests/
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f test_ioctl test_mmap test_interrupt
+	$(MAKE) -C driver/ clean
+	$(MAKE) -C tests/ clean

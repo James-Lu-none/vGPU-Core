@@ -29,24 +29,24 @@ make
 
 # global queue + spin_lock vs private queue per context
 sudo rmmod vgpu_core
-sudo insmod vgpu_core.ko queue_mode=0 dma_mode=0
-sudo ./test_ioctl
+sudo insmod driver/vgpu_core.ko queue_mode=0 dma_mode=0
+sudo ./tests/test_ioctl
 
 sudo rmmod vgpu_core
-sudo insmod vgpu_core.ko queue_mode=1 dma_mode=0
-sudo ./test_ioctl
+sudo insmod driver/vgpu_core.ko queue_mode=1 dma_mode=0
+sudo ./tests/test_ioctl
 
 # remap_pfn_range vs dma
 sudo rmmod vgpu_core
-sudo insmod vgpu_core.ko queue_mode=1 dma_mode=0
-sudo ./test_mmap
+sudo insmod driver/vgpu_core.ko queue_mode=1 dma_mode=0
+sudo ./tests/test_mmap
 
 sudo rmmod vgpu_core
-sudo insmod vgpu_core.ko queue_mode=1 dma_mode=1
-sudo ./test_mmap
+sudo insmod driver/vgpu_core.ko queue_mode=1 dma_mode=1
+sudo ./tests/test_mmap
 
 # test working queue & interrupt
 sudo rmmod vgpu_core
-sudo insmod vgpu_core.ko queue_mode=1 dma_mode=1
-sudo ./test_interrupt
+sudo insmod driver/vgpu_core.ko queue_mode=1 dma_mode=1
+sudo ./tests/test_interrupt
 ```
