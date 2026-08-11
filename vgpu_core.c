@@ -13,6 +13,9 @@
 // https://github.com/torvalds/linux/blob/master/include/linux/cdev.h 
 #include <linux/cdev.h>
 #include <linux/uaccess.h> // for copy_from_user
+
+#include <linux/list.h> // Intrusive Doubly Linked List for context
+
 #include "vgpu_ioctl.h"
 
 #define QUEUE_SIZE 128
@@ -23,6 +26,13 @@
 static int vgpu_mode = 0;
 module_param(vgpu_mode, int, 0444);
 MODULE_PARM_DESC(vgpu_mode, "0: Global Shared Queue (Mode A), 1: Private Context Queue (Mode B)");
+
+struct vgpu_context {
+    struct vgpu_command private_queue[QUEUE_SIZE];
+    int head;
+    int tail;
+    struct list_head list_node; // 這是用來串接在 vgpu_dev->ctx_list 上面的節點
+};
 
 struct vgpu_dev {
     dev_t dev;          // 儲存裝置號 (Major/Minor number)
@@ -40,6 +50,10 @@ struct vgpu_dev {
     int head;
     int tail;
     spinlock_t global_lock;
+
+    /* [Mode B] Private Context Queue (Single Process Single Context) */
+    struct list_head ctx_list; // 這是清單的「頭」
+    spinlock_t ctx_lock;       // 保護這個清單的鎖
 };
 
 struct vgpu_dev *g_vgpu_dev = NULL; // 全域變數，指向我們建立的裝置結構
@@ -48,12 +62,45 @@ struct class *g_vgpu_class = NULL;
 static int vgpu_open(struct inode *inode, struct file *file)
 {
     pr_info("vGPU-Core: open\n");
+    if (vgpu_mode == 0){
+        pr_info("vGPU-Core: Global Shared Queue (Mode A), skip context allocate\n");
+    } else {
+        pr_info("vGPU-Core: Private Context Queue (Mode B), start to allocate context\n");
+        struct vgpu_context *ctx;
+        
+        ctx = kzalloc(sizeof(struct vgpu_context), GFP_KERNEL);
+        if (!ctx) {
+            pr_err("vGPU-Core: failed to allocate context structure\n");
+            return -ENOMEM;
+        }
+        
+        // 將這個 Context 加進全域清單中
+        spin_lock(&g_vgpu_dev->ctx_lock);
+        list_add_tail(&ctx->list_node, &g_vgpu_dev->ctx_list);
+        spin_unlock(&g_vgpu_dev->ctx_lock);
+        
+        file->private_data = ctx;
+    }
     return 0;
 }
 
 static int vgpu_release(struct inode *inode, struct file *file)
 {
     pr_info("vGPU-Core: release\n");
+    if (vgpu_mode == 0){
+        pr_info("vGPU-Core: Global Shared Queue (Mode A), skip context allocate\n");
+    } else {
+        pr_info("vGPU-Core: Private Context Queue (Mode B), start to release context\n");
+        struct vgpu_context *ctx = file->private_data;
+        if (ctx) {
+            // 從全域清單中移除這個 Context
+            spin_lock(&g_vgpu_dev->ctx_lock);
+            list_del(&ctx->list_node);
+            spin_unlock(&g_vgpu_dev->ctx_lock);
+            
+            kfree(ctx);
+        }
+    }
     return 0;
 }
 
@@ -102,18 +149,38 @@ static long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 g_vgpu_dev->global_queue[g_vgpu_dev->tail] = user_cmd;
                 g_vgpu_dev->tail = (g_vgpu_dev->tail + 1) % QUEUE_SIZE;
                 
-                pr_info("vGPU-Core: [Mode A] Received command: opcode=%u, op1=%u, op2=%u. Queue Tail: %d\n",
-                        user_cmd.opcode, user_cmd.operand1, user_cmd.operand2, g_vgpu_dev->tail);
+                // pr_info("vGPU-Core: [Mode A] Received command: opcode=%u, op1=%u, op2=%u. Queue Tail: %d\n",
+                //        user_cmd.opcode, user_cmd.operand1, user_cmd.operand2, g_vgpu_dev->tail);
                 // 釋放lock
                 spin_unlock(&g_vgpu_dev->global_lock);
             } else {
-                pr_info("vGPU-Core: [Mode B] Not implemented yet.\n");
+                // [Mode B] 從 private_data 取出專屬 Queue，直接寫入 (Lock-free!)
+                struct vgpu_context *ctx = file->private_data;
+                if (!ctx) return -EFAULT;
+                
+                ctx->private_queue[ctx->tail] = user_cmd;
+                ctx->tail = (ctx->tail + 1) % QUEUE_SIZE;
+                
+                // pr_info("vGPU-Core: [Mode B] Received command: opcode=%u. Private Tail: %d\n",
+                //        user_cmd.opcode, ctx->tail);
             }
             break;
 
         case VGPU_IOC_DOORBELL:
             pr_info("vGPU-Core: Doorbell Rung! Hardware is starting to process commands...\n");
-            // TODO: process data
+            if (vgpu_mode == 1) {
+                struct vgpu_context *ctx;
+                int count = 0;
+                
+                spin_lock(&g_vgpu_dev->ctx_lock);
+                list_for_each_entry(ctx, &g_vgpu_dev->ctx_list, list_node) {
+                    pr_info("vGPU-Core: [Scheduler] Checking context %p, Head: %d, Tail: %d\n", 
+                            ctx, ctx->head, ctx->tail);
+                    count++;
+                }
+                spin_unlock(&g_vgpu_dev->ctx_lock);
+                pr_info("vGPU-Core: [Scheduler] Checked %d active contexts.\n", count);
+            }
             break;
 
         default:
@@ -156,6 +223,9 @@ static int __init vgpu_core_init(void)
     spin_lock_init(&g_vgpu_dev->global_lock);
     g_vgpu_dev->head = 0;
     g_vgpu_dev->tail = 0;
+    // Mode B
+    spin_lock_init(&g_vgpu_dev->ctx_lock);
+    INIT_LIST_HEAD(&g_vgpu_dev->ctx_list);
 
     // 2. 取得裝置號
     // 0 means base number, 1 means number of devices
@@ -208,7 +278,7 @@ err_cdev_add:
 err_alloc_chrdev_region:
     kfree(g_vgpu_dev);
     
-    return result; // 回傳錯誤碼
+    return result;
 
 }
 

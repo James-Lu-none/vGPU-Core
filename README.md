@@ -6,11 +6,16 @@ vGPU-Core 是一個基於 Linux Kernel 的虛擬 PCIe 加速器驅動程式。�
 ## build, install and check
 
 ```bash
+make clean
 make
-sudo insmod vgpu_core.ko
-ls -l /dev/vgpu0
 
-sudo rmmod vgpu_core.ko
+sudo rmmod vgpu_core
+sudo insmod vgpu_core.ko vgpu_mode=0
+sudo ./test_ioctl
+
+sudo rmmod vgpu_core
+sudo insmod vgpu_core.ko vgpu_mode=1
+sudo ./test_ioctl
 ```
 
 ## 實體gpu運作模式與vGPU運作比較
