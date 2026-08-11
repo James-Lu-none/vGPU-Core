@@ -17,6 +17,9 @@
 #include <linux/platform_device.h>
 #include <linux/dma-mapping.h>
 #include <linux/mm.h>
+#include <linux/workqueue.h>
+#include <linux/wait.h>
+#include <linux/delay.h>
 
 #include <linux/list.h> // Intrusive Doubly Linked List for context
 
@@ -38,6 +41,8 @@ struct vgpu_context {
     struct vgpu_command private_queue[QUEUE_SIZE];
     int head;
     int tail;
+    wait_queue_head_t wait_q; // [Phase 5] 模擬 IRQ 的等待區
+    int irq_fired;            // [Phase 5] 標記硬體是否算完
     struct list_head list_node; // 這是用來串接在 vgpu_dev->ctx_list 上面的節點
 };
 
@@ -48,7 +53,7 @@ struct vgpu_dev {
     struct cdev cdev;     // 儲存核心的 cdev 結構
     struct device *device; // 儲存核心的 device 結構
     
-    // 虛擬硬體：Platform Device (用於 Mode B 的 DMA API)
+    // 虛擬硬體：Platform Device (用於 DMA API)
     struct platform_device *pdev;
 
     // 因為這個結構體的生命週期跟硬體一樣長。只要裝置插在主機板上，這個結構體就在
@@ -67,9 +72,15 @@ struct vgpu_dev {
     struct list_head ctx_list; // 這是清單的「頭」
     spinlock_t ctx_lock;       // 保護這個清單的鎖
 
+    /* [Phase 5] Hardware Simulation */
+    struct workqueue_struct *hw_wq;
+    struct work_struct hw_work;
+    wait_queue_head_t wait_q; // 模擬 IRQ 的等待區
+    int irq_fired;            // 標記硬體是否算完
+
     /* Zero-Copy MMAP Buffer */
     void *data_buffer;         // Kernel 虛擬位址
-    dma_addr_t dma_handle;     // Mode B (DMA API) 使用的匯流排實體位址
+    dma_addr_t dma_handle;     // DMA API 使用的匯流排實體位址
 };
 
 struct vgpu_dev *g_vgpu_dev = NULL; // 全域變數，指向我們建立的裝置結構
@@ -79,9 +90,9 @@ static int vgpu_open(struct inode *inode, struct file *file)
 {
     pr_info("vGPU-Core: open\n");
     if (queue_mode == 0){
-        pr_info("vGPU-Core: Global Shared Queue (Mode A), skip context allocate\n");
+        pr_info("vGPU-Core: Global Shared Queue, skip context allocate\n");
     } else {
-        pr_info("vGPU-Core: Private Context Queue (Mode B), start to allocate context\n");
+        pr_info("vGPU-Core: Private Context Queue, start to allocate context\n");
         struct vgpu_context *ctx;
         
         ctx = kzalloc(sizeof(struct vgpu_context), GFP_KERNEL);
@@ -89,6 +100,10 @@ static int vgpu_open(struct inode *inode, struct file *file)
             pr_err("vGPU-Core: failed to allocate context structure\n");
             return -ENOMEM;
         }
+        
+        // 初始化 Context
+        init_waitqueue_head(&ctx->wait_q);
+        ctx->irq_fired = 0;
         
         // 將這個 Context 加進全域清單中
         spin_lock(&g_vgpu_dev->ctx_lock);
@@ -104,9 +119,9 @@ static int vgpu_release(struct inode *inode, struct file *file)
 {
     pr_info("vGPU-Core: release\n");
     if (queue_mode == 0){
-        pr_info("vGPU-Core: Global Shared Queue (Mode A), skip context allocate\n");
+        pr_info("vGPU-Core: Global Shared Queue, skip context allocate\n");
     } else {
-        pr_info("vGPU-Core: Private Context Queue (Mode B), start to release context\n");
+        pr_info("vGPU-Core: Private Context Queue, start to release context\n");
         struct vgpu_context *ctx = file->private_data;
         if (ctx) {
             // 從全域清單中移除這個 Context
@@ -148,6 +163,41 @@ static ssize_t vgpu_read(struct file *filp,
    return bytes_read;
 }
 
+
+// [Phase 5] 模擬 GPU 背景硬體處理與 IRQ 喚醒
+static void vgpu_hw_work_func(struct work_struct *work)
+{
+    pr_info("vGPU-Core: [Hardware] GPU is processing commands...\n");
+    
+    // 模擬硬體運算延遲
+    msleep(500); 
+
+    if (queue_mode == 0) {
+        // Global Queue
+        spin_lock(&g_vgpu_dev->global_lock);
+        g_vgpu_dev->head = g_vgpu_dev->tail; // 假裝清空指令
+        g_vgpu_dev->irq_fired = 1;
+        spin_unlock(&g_vgpu_dev->global_lock);
+        
+        pr_info("vGPU-Core: [Hardware] Global Queue compute done. Firing IRQ...\n");
+        wake_up_interruptible(&g_vgpu_dev->wait_q);
+    } else {
+        // Private Queue: 從所有 Context 中找出有任務的來執行 (簡易 Scheduler)
+        struct vgpu_context *ctx;
+        
+        spin_lock(&g_vgpu_dev->ctx_lock);
+        list_for_each_entry(ctx, &g_vgpu_dev->ctx_list, list_node) {
+            if (ctx->head != ctx->tail) {
+                ctx->head = ctx->tail; // 假裝清空指令
+                ctx->irq_fired = 1;
+                pr_info("vGPU-Core: [Hardware] Private Queue compute done for ctx %p. Firing IRQ...\n", ctx);
+                wake_up_interruptible(&ctx->wait_q);
+            }
+        }
+        spin_unlock(&g_vgpu_dev->ctx_lock);
+    }
+}
+
 static long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct vgpu_command user_cmd;
@@ -183,22 +233,27 @@ static long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             break;
 
         case VGPU_IOC_DOORBELL:
-            pr_info("vGPU-Core: Doorbell Rung! Hardware is starting to process commands...\n");
+            pr_info("vGPU-Core: Doorbell Rung! Notifying hardware...\n");
             if (g_vgpu_dev->data_buffer) {
                 pr_info("vGPU-Core: [Data Path] GPU reading Data Buffer: '%s'\n", (char *)g_vgpu_dev->data_buffer);
             }
-            if (queue_mode == 1) {
-                struct vgpu_context *ctx;
-                int count = 0;
-                
-                spin_lock(&g_vgpu_dev->ctx_lock);
-                list_for_each_entry(ctx, &g_vgpu_dev->ctx_list, list_node) {
-                    pr_info("vGPU-Core: [Scheduler] Checking context %p, Head: %d, Tail: %d\n", 
-                            ctx, ctx->head, ctx->tail);
-                    count++;
-                }
-                spin_unlock(&g_vgpu_dev->ctx_lock);
-                pr_info("vGPU-Core: [Scheduler] Checked %d active contexts.\n", count);
+            // 將硬體模擬任務丟進背景 Workqueue 非同步執行
+            queue_work(g_vgpu_dev->hw_wq, &g_vgpu_dev->hw_work);
+            break;
+
+        case VGPU_IOC_WAIT_FOR_IRQ:
+            if (queue_mode == 0) {
+                pr_info("vGPU-Core: [Global Queue] Process sleeping on wait_q...\n");
+                g_vgpu_dev->irq_fired = 0;
+                wait_event_interruptible(g_vgpu_dev->wait_q, g_vgpu_dev->irq_fired != 0);
+                pr_info("vGPU-Core: [Global Queue] Process woken up by IRQ!\n");
+            } else {
+                struct vgpu_context *ctx = file->private_data;
+                if (!ctx) return -EFAULT;
+                pr_info("vGPU-Core: [Private Queue] Process sleeping on ctx %p wait_q...\n", ctx);
+                ctx->irq_fired = 0;
+                wait_event_interruptible(ctx->wait_q, ctx->irq_fired != 0);
+                pr_info("vGPU-Core: [Private Queue] Process woken up by IRQ!\n");
             }
             break;
 
@@ -263,13 +318,19 @@ static int __init vgpu_core_init(void)
         return -ENOMEM;
     }
     
-    // 初始化 Global Ring Buffer 與 Lock (Mode A)
+    // 初始化 Global Ring Buffer 與 Lock (Global Queue)
     spin_lock_init(&g_vgpu_dev->global_lock);
     g_vgpu_dev->head = 0;
     g_vgpu_dev->tail = 0;
-    // Mode B
+    // Private Queue
     spin_lock_init(&g_vgpu_dev->ctx_lock);
     INIT_LIST_HEAD(&g_vgpu_dev->ctx_list);
+
+    // [Phase 5] 初始化 Workqueue 與 Global Queue 的 Wait Queue
+    g_vgpu_dev->hw_wq = create_singlethread_workqueue("vgpu_hw_wq");
+    INIT_WORK(&g_vgpu_dev->hw_work, vgpu_hw_work_func);
+    init_waitqueue_head(&g_vgpu_dev->wait_q);
+    g_vgpu_dev->irq_fired = 0;
 
     // 2. 取得裝置號
     // 0 means base number, 1 means number of devices
@@ -368,6 +429,12 @@ err_alloc_chrdev_region:
 static void __exit vgpu_core_exit(void)
 {
     if (g_vgpu_dev) {
+        // [Phase 5] 關閉 Workqueue
+        if (g_vgpu_dev->hw_wq) {
+            flush_workqueue(g_vgpu_dev->hw_wq);
+            destroy_workqueue(g_vgpu_dev->hw_wq);
+        }
+
         // 6. 釋放 MMAP Data Buffer
         if (dma_mode == 1) {
             if (g_vgpu_dev->data_buffer) {

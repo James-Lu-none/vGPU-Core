@@ -53,4 +53,9 @@ struct vgpu_command {
  */
 #define VGPU_IOC_DOORBELL   _IO(VGPU_IOC_MAGIC,  2)
 
+/*
+ * 等待虛擬硬體的 IRQ 中斷
+ */
+#define VGPU_IOC_WAIT_FOR_IRQ _IO(VGPU_IOC_MAGIC, 3)
+
 #endif /* _VGPU_IOCTL_H */
