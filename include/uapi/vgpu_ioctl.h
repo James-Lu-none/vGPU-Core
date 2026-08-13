@@ -58,4 +58,6 @@ struct vgpu_command {
  */
 #define VGPU_IOC_WAIT_FOR_IRQ _IO(VGPU_IOC_MAGIC, 3)
 
+#define VGPU_IOC_MAXNR 3
+
 #endif /* _VGPU_IOCTL_H */

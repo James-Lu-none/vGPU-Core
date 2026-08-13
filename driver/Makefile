@@ -1,5 +1,7 @@
-obj-m += vgpu_core.o
-vgpu_core-objs := vgpu_main.o vgpu_ioctl.o vgpu_mmap.o vgpu_sched.o
+obj-m += vgpu_driver.o
+vgpu_driver-objs := vgpu_main.o vgpu_ioctl.o vgpu_mmap.o vgpu_sched.o
+
+obj-m += vgpu_board.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)

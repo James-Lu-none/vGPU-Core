@@ -22,6 +22,10 @@ extern int queue_mode;
 extern int dma_mode;
 
 struct vgpu_context {
+    // for one vgpu, each open context only needs the private queue
+    // in multi vgpu, additional parameter dev is required to know
+    // which vgpu device this context belongs to
+    struct vgpu_dev *dev;
     struct vgpu_command private_queue[QUEUE_SIZE];
     int head;
     int tail;
@@ -31,6 +35,8 @@ struct vgpu_context {
 };
 
 struct vgpu_dev {
+    // use minor number to identify each vgpu device in /dev/vgpuX
+    int minor;
     struct cdev cdev;
     struct device *device;
     struct platform_device *pdev;
@@ -52,7 +58,8 @@ struct vgpu_dev {
     dma_addr_t dma_handle;
 };
 
-extern struct vgpu_dev *g_vgpu_dev;
+#define MAX_VGPU_DEVICES 4
+
 extern struct class *g_vgpu_class;
 
 long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
