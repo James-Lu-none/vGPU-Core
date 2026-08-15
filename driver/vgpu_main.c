@@ -107,24 +107,34 @@ static const struct file_operations vgpu_fops = {
 // static int vgpu_probe(struct platform_device *pdev)
 static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
+    // The physical pci device itself is hardwired with its requirements in the Base Address Register (BAR) (etc: 256MB of MMIO space, 64bit addressing)
+    // And during the system boot, the pci subsystem of bios/kernel will fetch those info from device and allocate a portion of physical address space accordingly
+    // and write the address of the allocated physical address space back into the device's BAR
+
     int result;
     struct vgpu_dev *dev;
-    
+
     pr_info("vGPU-Core: probing PCI device %04x:%04x...\n", pdev->vendor, pdev->device);
 
+    // Enable the physical PCI device and configure PCIe device's Configuration Space, enable memory/IO decoding, assigning interrupt numbers
     result = pci_enable_device(pdev);
     if (result) {
         pr_err("vGPU-Core: failed to enable PCI device\n");
         return result;
     }
 
+    // declare the the pci device is now under driver's control, preventing other drivers
+    // from accessing the same resource, and will be released when the driver is unloaded
     result = pci_request_regions(pdev, "vgpu_core");
     if (result) {
         pr_err("vGPU-Core: failed to request PCI regions\n");
         goto err_disable;
     }
 
-    pci_set_master(pdev); // Enable DMA bus mastering
+    // enable DMA bus mastering capability of the physical PCI device
+    // this is required for the device to perform DMA operations
+    // as it allows the device to initiate DMA transfers without CPU intervention
+    pci_set_master(pdev);
 
     dev = kzalloc(sizeof(struct vgpu_dev), GFP_KERNEL);
     if (!dev) {
@@ -139,9 +149,12 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
     // Map BAR0 for MMIO (AXI Lite registers)
     // see page 292 of https://bootlin.com/doc/training/linux-kernel/linux-kernel-slides.pdf
-    // pci_ioremap_bar() will read BAR0's physical address from FPGA
+    // pci_ioremap_bar() will read BAR0's physical address that was assigned during boot by pci subsystem from FPGA
     // and call void __iomem *ioremap(phys_addr_t phys_addr, unsigned long size);
-    // and update the page table to add a mapping entry
+    // and update the page table to add a mapping entry that maps a virtual memory region to physical memory region
+    // mmio_base is the pointer that points to the virtual memory address of BAR0 in kernel space
+    // writing data to mmio_base with offset can then trigger cpu to perform a Memory write TLP (Transaction Layer Packet)
+    // to the XDMA IP in the FPGA, and FPGA will write data to the target memory-mapped register in FPGA.
     dev->mmio_base = pci_ioremap_bar(pdev, 0);
     if (!dev->mmio_base) {
         pr_err("vGPU-Core: failed to ioremap BAR0\n");
