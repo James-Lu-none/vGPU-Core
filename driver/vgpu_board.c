@@ -1,3 +1,7 @@
+/*
+
+deprecated as new setup uses real pci device instead of virtualized platform device
+
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include "../include/vgpu/vgpu_core.h"
@@ -44,3 +48,4 @@ module_exit(vgpu_board_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("vGPU Team");
 MODULE_DESCRIPTION("Fake Motherboard for vGPU Devices");
+*/

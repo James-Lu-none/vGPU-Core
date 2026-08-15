@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 #include <linux/mm.h>
 #include <linux/delay.h>
+#include <linux/pci.h>
 #include "../uapi/vgpu_ioctl.h"
 
 #define QUEUE_SIZE 256
@@ -39,7 +40,8 @@ struct vgpu_dev {
     int minor;
     struct cdev cdev;
     struct device *device;
-    struct platform_device *pdev;
+    struct pci_dev *pci_dev;
+    void __iomem *mmio_base; // Mapped PCIe Base Address Register 0 (BAR0) address
 
     struct vgpu_command global_queue[QUEUE_SIZE];
     int head;

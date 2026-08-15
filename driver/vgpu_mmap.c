@@ -10,7 +10,7 @@ int vgpu_mmap(struct file *file, struct vm_area_struct *vma)
     pr_info("vGPU-Core: mmap called on vgpu%d, size: %zu\n", dev->minor, size);
 
     if (dma_mode == 1) {
-        return dma_mmap_coherent(&dev->pdev->dev, vma, 
+        return dma_mmap_coherent(&dev->pci_dev->dev, vma, 
                                  dev->data_buffer, 
                                  dev->dma_handle, size);
     } else {
