@@ -27,11 +27,19 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             break;
 
         case VGPU_IOC_DOORBELL:
-            pr_info("vGPU-Core: Doorbell Rung! Notifying hardware %d...\n", dev->minor);
+            /*
+             * MMIO Write: Ringing the Doorbell
+             * Instead of simulating hardware with a Kernel Workqueue, we now
+             * write a value directly to the FPGA's Base Address Register (BAR0).
+             * iowrite32() translates to an atomic Memory Write TLP (Transaction Layer Packet)
+             * over the PCIe bus, telling the FPGA: "Data is ready in memory, start DMA!"
+             */
+            pr_info("vGPU-Core: Doorbell Rung! Notifying FPGA %d via MMIO...\n", dev->minor);
             if (dev->data_buffer) {
                 pr_info("vGPU-Core: [Data Path] GPU reading Data Buffer: '%s'\n", (char *)dev->data_buffer);
             }
-            queue_work(dev->hw_wq, &dev->hw_work);
+            // Write 1 to the Doorbell offset in BAR0
+            iowrite32(1, dev->mmio_base + VGPU_DOORBELL_OFFSET);
             break;
 
         case VGPU_IOC_WAIT_FOR_IRQ:

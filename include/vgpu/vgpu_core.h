@@ -17,6 +17,25 @@
 #include <linux/pci.h>
 #include "../uapi/vgpu_ioctl.h"
 
+/*
+ * MMIO Register Offsets
+ * These are the offsets within BAR0 that the FPGA exposes.
+ * 
+ * In a real FPGA design (e.g. using Xilinx XDMA IP), the Address mapping works as follows:
+ * 1. CPU writes to (dev->mmio_base + 0x40).
+ * 2. This creates a PCIe Memory Write TLP aimed at BAR0 + 0x40.
+ * 3. XDMA IP receives the TLP and applies "PCIe-to-AXI Translation", converting it to an 
+ *    AXI-Lite transaction with address (AXI_BASE_ADDR + 0x40) on its M_AXI_LITE port.
+ * 4. The Vivado AXI Interconnect (configured via Address Editor) routes this transaction
+ *    to our custom AXI-Lite Slave IP.
+ * 5. Our custom IP decodes the 0x40 offset (slv_reg16) to trigger the hardware state machine (Doorbell).
+ * Driver -> PCIe -> XDMA -> AXI Interconnect -> Custom IP
+ */
+
+#define VGPU_DOORBELL_OFFSET     0x40
+#define VGPU_INT_STATUS_OFFSET   0x44
+#define VGPU_INT_ACK_OFFSET      0x48
+
 #define QUEUE_SIZE 256
 
 extern int queue_mode;
@@ -42,6 +61,7 @@ struct vgpu_dev {
     struct device *device;
     struct pci_dev *pci_dev;
     void __iomem *mmio_base; // Mapped PCIe Base Address Register 0 (BAR0) address
+    int irq;                 // The IRQ number allocated by the PCI subsystem for this device
 
     struct vgpu_command global_queue[QUEUE_SIZE];
     int head;
@@ -51,8 +71,6 @@ struct vgpu_dev {
     struct list_head ctx_list;
     spinlock_t ctx_lock;
 
-    struct workqueue_struct *hw_wq;
-    struct work_struct hw_work;
     wait_queue_head_t wait_q;
     int irq_fired;
 
@@ -67,5 +85,6 @@ extern struct class *g_vgpu_class;
 long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 int vgpu_mmap(struct file *file, struct vm_area_struct *vma);
 void vgpu_hw_work_func(struct work_struct *work);
+irqreturn_t vgpu_irq_handler(int irq, void *dev_id);
 
 #endif /* _VGPU_CORE_H */

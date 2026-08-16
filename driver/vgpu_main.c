@@ -136,6 +136,19 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     // as it allows the device to initiate DMA transfers without CPU intervention
     pci_set_master(pdev);
 
+    /*
+     * Hardware Capability: MSI/MSI-X Interrupt Allocation
+     * Modern PCIe devices don't use physical interrupt pins (INTx) which cause sharing conflicts.
+     * Instead, they use Message Signaled Interrupts (MSI), where the device writes a specific value
+     * to a specific memory address to trigger an interrupt on the CPU.
+     * pci_alloc_irq_vectors() asks the PCI subsystem to allocate these vectors for us.
+     */
+    result = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_MSIX);
+    if (result < 0) {
+        pr_err("vGPU-Core: failed to allocate IRQ vectors\n");
+        goto err_disable;
+    }
+
     dev = kzalloc(sizeof(struct vgpu_dev), GFP_KERNEL);
     if (!dev) {
         pr_err("vGPU-Core: failed to allocate vgpu_dev\n");
@@ -162,6 +175,12 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         goto err_free;
     }
 
+    /*
+     * Retrieve the actual IRQ number assigned to vector 0.
+     * This number represents the Linux logical IRQ number mapped to the physical MSI vector.
+     */
+    dev->irq = pci_irq_vector(pdev, 0);
+
     dev->minor = atomic_inc_return(&vgpu_minor_counter) - 1;
     if (dev->minor >= MAX_VGPU_DEVICES) {
         pr_err("vGPU-Core: exceeded maximum number of devices\n");
@@ -179,8 +198,6 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     spin_lock_init(&dev->ctx_lock);
     INIT_LIST_HEAD(&dev->ctx_list);
 
-    dev->hw_wq = alloc_workqueue("vgpu_hw_wq_%d", WQ_UNBOUND, 1, dev->minor);
-    INIT_WORK(&dev->hw_work, vgpu_hw_work_func);
     init_waitqueue_head(&dev->wait_q);
     dev->irq_fired = 0;
 
@@ -193,7 +210,7 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         if (!dev->data_buffer) {
             pr_err("vGPU-Core: failed to allocate DMA memory\n");
             result = -ENOMEM;
-            goto err_wq;
+            goto err_iounmap;
         }
         pr_info("vGPU-Core: Allocated DMA buffer at %p (bus addr: %llx)\n", 
                 dev->data_buffer, (unsigned long long)dev->dma_handle);
@@ -202,10 +219,23 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         if (!dev->data_buffer) {
             pr_err("vGPU-Core: failed to allocate pages\n");
             result = -ENOMEM;
-            goto err_wq;
+            goto err_iounmap;
         }
         pr_info("vGPU-Core: Allocated pure software page buffer at %p\n", 
                 dev->data_buffer);
+    }
+
+    /*
+     * IRQ Registration: request_irq()
+     * We tell the Kernel's generic IRQ subsystem: "When interrupt number dev->irq fires,
+     * please execute vgpu_irq_handler". 
+     * The last argument 'dev' is the dev_id, an opaque pointer passed back to our handler
+     * so we know *which* specific vGPU device triggered the interrupt.
+     */
+    result = request_irq(dev->irq, vgpu_irq_handler, 0, "vgpu_irq", dev);
+    if (result) {
+        pr_err("vGPU-Core: failed to request IRQ %d\n", dev->irq);
+        goto err_mem;
     }
 
     /*
@@ -240,16 +270,16 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 err_cdev:
     cdev_del(&dev->cdev);
+    free_irq(dev->irq, dev);
 err_mem:
     if (dma_mode == 1) dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->data_buffer, dev->dma_handle);
     else free_pages((unsigned long)dev->data_buffer, 0);
-err_wq:
-    destroy_workqueue(dev->hw_wq);
 err_iounmap:
     pci_iounmap(pdev, dev->mmio_base);
 err_free:
     kfree(dev);
 err_regions:
+    pci_free_irq_vectors(pdev);
     pci_release_regions(pdev);
 err_disable:
     pci_disable_device(pdev);
@@ -274,18 +304,29 @@ static void vgpu_remove(struct pci_dev *pdev)
             free_pages((unsigned long)dev->data_buffer, 0);
         }
 
-        if (dev->hw_wq) {
-            flush_workqueue(dev->hw_wq);
-            destroy_workqueue(dev->hw_wq);
-        }
-
         if (dev->mmio_base) {
             pci_iounmap(pdev, dev->mmio_base);
+        }
+
+        if (dev->irq) {
+            /*
+             * IRQ Teardown: free_irq()
+             * Unregisters our handler. Crucially, this function will wait for any 
+             * currently executing interrupt handlers to finish before returning,
+             * ensuring we don't free 'dev' while the IRQ handler is still using it.
+             */
+            free_irq(dev->irq, dev);
         }
 
         kfree(dev);
     }
     
+    /*
+     * Hardware Teardown: pci_free_irq_vectors()
+     * Tells the PCI subsystem to release the MSI/MSI-X vectors assigned to this device,
+     * freeing up system interrupt resources.
+     */
+    pci_free_irq_vectors(pdev);
     pci_release_regions(pdev);
     pci_disable_device(pdev);
 }
