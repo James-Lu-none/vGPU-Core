@@ -1,0 +1,97 @@
+sequenceDiagram
+    autonumber
+    
+    box User Space
+    participant App as User App
+    end
+    
+    box Linux Kernel Space
+    participant VFS as VFS (File System)
+    participant PCI as PCI Subsystem
+    participant Driver as vGPU Driver
+    end
+    
+    box Hardware & FPGA
+    participant PCIe as PCIe Bus (Motherboard)
+    participant XDMA as XDMA IP (Endpoint)
+    participant AXI as AXI Interconnect
+    participant vGPU_IP as Custom vGPU IP
+    end
+
+    %% Phase 1: Boot & Driver Load
+    Note over App, vGPU_IP: [1] Boot & Driver Initialization
+    PCI->>PCIe: PCIe Bus Enumeration (BIOS/Kernel boot)
+    PCIe-->>PCI: Discover FPGA (Vendor ID: 0x10EE)
+    PCI->>PCI: Assign Physical Address to BAR0
+    
+    Driver->>PCI: module_init() -> pci_register_driver()
+    PCI->>Driver: Match ID -> vgpu_probe(pdev)
+    
+    Driver->>PCI: pci_enable_device(), pci_request_regions()
+    Driver->>PCI: pci_ioremap_bar(pdev, 0)
+    PCI-->>Driver: Returns mmio_base (Virtual Addr mapped to BAR0)
+    
+    Driver->>PCI: pci_alloc_irq_vectors() (Request MSI/MSI-X)
+    Driver->>PCI: request_irq(dev->irq, vgpu_irq_handler)
+    
+    Driver->>Driver: dma_alloc_coherent() (Allocate Physical RAM for DMA)
+    Driver->>VFS: cdev_add(), device_create(/dev/vgpu0)
+
+    %% Phase 2: User Initialization
+    Note over App, vGPU_IP: [2] Application Initialization
+    App->>VFS: open("/dev/vgpu0")
+    VFS->>Driver: vgpu_open() (Allocates vgpu_context)
+    Driver-->>App: File Descriptor (fd)
+    
+    App->>VFS: mmap(fd, size)
+    VFS->>Driver: vgpu_mmap()
+    Driver->>Driver: dma_mmap_coherent() (Map DMA Buffer to User Space PTE)
+    Driver-->>App: User Virtual Address (ptr)
+
+    %% Phase 3: Command Submission & Doorbell (PCIe + AXI)
+    Note over App, vGPU_IP: [3] Command Submission & HW Doorbell
+    App->>App: Write Command Data to mapped buffer (ptr)
+    App->>VFS: ioctl(fd, VGPU_IOC_DOORBELL)
+    VFS->>Driver: vgpu_ioctl()
+    
+    Note over Driver, PCIe: iowrite32(1, mmio_base + 0x40)
+    Driver->>PCIe: Issue Memory Write TLP (Target: BAR0 + 0x40)
+    PCIe->>XDMA: Deliver TLP to FPGA Endpoint
+    
+    Note over XDMA, AXI: PCIe-to-AXI Translation
+    XDMA->>AXI: AXI-Lite Write (Addr: 0x4000_0040)
+    AXI->>vGPU_IP: Route to Custom IP (Offset: slv_reg16)
+    
+    Note over vGPU_IP: Hardware FSM starts processing!
+    
+    Driver->>Driver: Return from ioctl
+    App->>VFS: ioctl(fd, VGPU_IOC_WAIT_FOR_IRQ)
+    VFS->>Driver: vgpu_ioctl() -> wait_event_interruptible()
+    Note over App, Driver: Thread goes to SLEEP (Context Switch)
+
+    %% Phase 4: FPGA DMA & Interrupt
+    Note over App, vGPU_IP: [4] Hardware Execution & MSI Interrupt
+    vGPU_IP->>XDMA: DMA Read Request (AXI-MM)
+    XDMA->>PCIe: Memory Read TLP (Fetch data from Host RAM)
+    PCIe-->>XDMA: Memory Read Completion (Data)
+    vGPU_IP->>vGPU_IP: GPU/AI Compute...
+    vGPU_IP->>XDMA: DMA Write Request (Write results back)
+    
+    Note over vGPU_IP: Compute Done! Assert usr_irq
+    vGPU_IP->>XDMA: Assert Interrupt wire
+    XDMA->>PCIe: Issue MSI Memory Write TLP (to CPU APIC)
+    
+    PCIe->>PCI: CPU receives MSI Interrupt
+    PCI->>Driver: Execute Top-Half: vgpu_irq_handler()
+    
+    Note over Driver, PCIe: Acknowledge Hardware
+    Driver->>PCIe: ioread32(mmio_base + 0x44) (Read Status)
+    Driver->>PCIe: iowrite32(status, mmio_base + 0x48) (ACK)
+    PCIe->>XDMA: TLP to clear FPGA interrupt
+    
+    Note over Driver: Wake up Application
+    Driver->>Driver: wake_up_interruptible(wait_q)
+    Driver-->>PCI: return IRQ_HANDLED (Exit Interrupt Context)
+    
+    Driver-->>App: VGPU_IOC_WAIT_FOR_IRQ returns
+    Note over App: Thread WAKES UP. Results are ready in memory!
