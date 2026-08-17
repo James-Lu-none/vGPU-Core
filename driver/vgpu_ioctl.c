@@ -16,13 +16,46 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             }
 
             if (queue_mode == 0) {
+                u32 head, tail;
+
+                // Protect multiple CPU producer threads from stepping on each other
                 spin_lock(&dev->global_lock);
-                dev->global_queue[dev->tail] = user_cmd;
-                dev->tail = (dev->tail + 1) % QUEUE_SIZE;
+                
+                /*
+                 * Lock-Free Memory Barrier: smp_load_acquire()
+                 * Guarantees that we read the most up-to-date 'head' updated by the FPGA DMA.
+                 * Any memory operations after this will not be reordered before it.
+                 */
+                head = smp_load_acquire(&dev->ring->head);
+                tail = dev->ring->tail;
+                
+                if ((tail + 1) % QUEUE_SIZE == head) {
+                    spin_unlock(&dev->global_lock);
+                    return -EBUSY; // Queue Full
+                }
+                
+                // Write the command data into the DMA-mapped Ring Buffer
+                dev->ring->cmds[tail] = user_cmd;
+                
+                /*
+                 * Lock-Free Memory Barrier: smp_store_release()
+                 * CRITICAL: Ensures that the user_cmd is completely committed to System RAM 
+                 * BEFORE we update the tail pointer. If the CPU out-of-order execution writes 
+                 * the tail first, the FPGA might fetch garbage data!
+                 */
+                smp_store_release(&dev->ring->tail, (tail + 1) % QUEUE_SIZE);
+                
                 spin_unlock(&dev->global_lock);
             } else {
-                ctx->private_queue[ctx->tail] = user_cmd;
-                ctx->tail = (ctx->tail + 1) % QUEUE_SIZE;
+                // 原本一個 context 所有的資訊都在 kernel space 的記憶體裡
+                // 但在改成有實體 gpu 跟 dma 之後，每個 process (context) 除了原本 ctx 以外
+                // 還需要一個獨立的 dma_alloc_coherent 拿來放 command ring buffer
+                // 然後讓 hardware 端做硬體切換 context 的功能
+                // 才能實現多租戶 lock free 的功能
+                // ctx->private_queue[ctx->tail] = user_cmd;
+                // ctx->tail = (ctx->tail + 1) % QUEUE_SIZE;
+                pr_err("vGPU-Core: Private queue mode currently unmapped to DMA\n");
+                return -ENOTSUPP;
             }
             break;
 

@@ -31,29 +31,27 @@ irqreturn_t vgpu_irq_handler(int irq, void *dev_id)
     pr_info("vGPU-Core: [Hardware] IRQ received on vgpu%d! (status: 0x%x)\n", dev->minor, status);
     
     /*
-     * Step 2: Update software state & Wake up User Space.
-     * In the old workqueue simulation, we used msleep() to simulate compute time.
-     * Here, the compute time *actually happened in the hardware*, so we are already done.
-     * We just need to update the Ring Buffer head and wake up the User Space thread.
+     * Step 2: Wake up User Space.
+     * With a lock-free Ring Buffer, the FPGA has already updated 'ring->head' 
+     * via a PCIe DMA Write directly into Host RAM before asserting this MSI interrupt.
+     * The CPU does NOT need to update head or tail here. We simply wake up 
+     * the thread waiting in VGPU_IOC_DOORBELL_AND_WAIT.
      */
     if (queue_mode == 0) {
-        spin_lock(&dev->global_lock);
-        dev->head = dev->tail; 
+        /*
+         * Note: In a pure lock-free design, we could even use smp_load_acquire(&dev->ring->head)
+         * to check exactly how many commands the FPGA finished. For now, we just wake up.
+         */
         dev->irq_fired = 1;
-        spin_unlock(&dev->global_lock);
-        
-        // Wake up any thread stuck in VGPU_IOC_WAIT_FOR_IRQ
         wake_up_interruptible(&dev->wait_q);
     } else {
         struct vgpu_context *ctx;
         
         spin_lock(&dev->ctx_lock);
         list_for_each_entry(ctx, &dev->ctx_list, list_node) {
-            if (ctx->head != ctx->tail) {
-                ctx->head = ctx->tail; 
-                ctx->irq_fired = 1;
-                wake_up_interruptible(&ctx->wait_q);
-            }
+            // Wake everyone up in private queue mode for simplicity
+            ctx->irq_fired = 1;
+            wake_up_interruptible(&ctx->wait_q);
         }
         spin_unlock(&dev->ctx_lock);
     }

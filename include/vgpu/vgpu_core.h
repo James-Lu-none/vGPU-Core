@@ -40,6 +40,18 @@
 
 #define QUEUE_SIZE 256
 
+/*
+ * Lock-Free Ring Buffer (Shared between CPU and FPGA)
+ * This structure is mapped directly into the DMA buffer.
+ * - CPU (Producer): Writes to cmds[tail], then uses smp_store_release(&tail).
+ * - FPGA (Consumer): Reads cmds[head], processes, then DMA writes to 'head'.
+ */
+struct vgpu_ring_buffer {
+    volatile u32 head; /* Updated by FPGA via DMA Write */
+    volatile u32 tail; /* Updated by CPU (Host) */
+    struct vgpu_command cmds[QUEUE_SIZE];
+};
+
 extern int queue_mode;
 extern int dma_mode;
 
@@ -48,9 +60,7 @@ struct vgpu_context {
     // in multi vgpu, additional parameter dev is required to know
     // which vgpu device this context belongs to
     struct vgpu_dev *dev;
-    struct vgpu_command private_queue[QUEUE_SIZE];
-    int head;
-    int tail;
+    struct vgpu_ring_buffer *ring; // Points to a separate DMA buffer if queue_mode == 1
     wait_queue_head_t wait_q;
     int irq_fired;
     struct list_head list_node;
@@ -65,10 +75,8 @@ struct vgpu_dev {
     void __iomem *mmio_base; // Mapped PCIe Base Address Register 0 (BAR0) address
     int irq;                 // The IRQ number allocated by the PCI subsystem for this device
 
-    struct vgpu_command global_queue[QUEUE_SIZE];
-    int head;
-    int tail;
-    spinlock_t global_lock;
+    struct vgpu_ring_buffer *ring; // Points to data_buffer (used as global queue)
+    spinlock_t global_lock;        // Lock among multiple CPU producers (threads)
 
     struct list_head ctx_list;
     spinlock_t ctx_lock;

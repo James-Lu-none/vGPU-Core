@@ -192,8 +192,6 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     pci_set_drvdata(pdev, dev);
 
     spin_lock_init(&dev->global_lock);
-    dev->head = 0;
-    dev->tail = 0;
     
     spin_lock_init(&dev->ctx_lock);
     INIT_LIST_HEAD(&dev->ctx_list);
@@ -232,6 +230,10 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         pr_info("vGPU-Core: Allocated pure software page buffer at %p\n", 
                 dev->data_buffer);
     }
+
+    dev->ring = (struct vgpu_ring_buffer *)dev->data_buffer;
+    dev->ring->head = 0;
+    dev->ring->tail = 0;
 
     /*
      * IRQ Registration: request_irq()

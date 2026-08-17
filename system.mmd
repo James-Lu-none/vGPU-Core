@@ -60,8 +60,15 @@ sequenceDiagram
     Driver-->>App: Map System RAM to User Virtual Address (Zero-copy)
 
     %% Phase 3: Command Submission & Doorbell (PCIe + AXI)
-    Note over App, vGPU_IP: [3] Command Submission & HW Doorbell (Atomic Wait)
-    App->>RAM: Write Command Data to mapped buffer (Zero-copy)
+    Note over App, vGPU_IP: [3] Command Submission (Lock-Free) & HW Doorbell
+    Note over App: CPU Producer: Check if Queue is Full
+    App->>RAM: smp_load_acquire(&ring->head) (Read FPGA's head safely)
+    
+    App->>RAM: Write Command Data to ring->cmds[tail] (Zero-copy)
+    
+    Note over App: CPU Producer: Update Tail with Memory Barrier
+    App->>RAM: smp_store_release(&ring->tail) (Ensure data is committed before tail updates)
+    
     App->>VFS: ioctl(fd, VGPU_IOC_DOORBELL_AND_WAIT)
     VFS->>Driver: vgpu_ioctl()
     
@@ -83,17 +90,21 @@ sequenceDiagram
 
     %% Phase 4: FPGA DMA & Interrupt
     Note over App, vGPU_IP: [4] Hardware Execution & MSI Interrupt
-    vGPU_IP->>XDMA: DMA Read Request (AXI-MM)
-    XDMA->>PCIe: Memory Read TLP (Fetch data from Host RAM)
+    
+    Note over vGPU_IP, PCIe: FPGA Consumer: Read Command
+    vGPU_IP->>XDMA: DMA Read Request (Fetch cmds[head])
+    XDMA->>PCIe: Memory Read TLP (Host RAM)
     PCIe->>RAM: Direct Memory Access (DMA Read)
-    RAM-->>PCIe: Return Data Payload
+    RAM-->>PCIe: Return Command Data Payload
     PCIe-->>XDMA: Memory Read Completion (Data)
     
     vGPU_IP->>vGPU_IP: GPU/AI Compute...
     
+    Note over vGPU_IP, PCIe: FPGA Consumer: Write Results & Update Head
     vGPU_IP->>XDMA: DMA Write Request (Write results back)
+    vGPU_IP->>XDMA: DMA Write Request (Update ring->head)
     XDMA->>PCIe: Memory Write TLP
-    PCIe->>RAM: Direct Memory Access (DMA Write)
+    PCIe->>RAM: Direct Memory Access (DMA Write data & new head)
     
     Note over vGPU_IP: Compute Done! Assert usr_irq
     vGPU_IP->>XDMA: Assert Interrupt wire
