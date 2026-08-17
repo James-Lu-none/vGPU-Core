@@ -11,8 +11,12 @@ sequenceDiagram
     participant Driver as vGPU Driver
     end
     
-    box Hardware & FPGA
+    box Motherboard
+    participant RAM as System RAM (Host)
     participant PCIe as PCIe Bus (Motherboard)
+    end
+    
+    box FPGA
     participant XDMA as XDMA IP (Endpoint)
     participant AXI as AXI Interconnect
     participant vGPU_IP as Custom vGPU IP
@@ -22,7 +26,9 @@ sequenceDiagram
     Note over App, vGPU_IP: [1] Boot & Driver Initialization
     PCI->>PCIe: PCIe Bus Enumeration (BIOS/Kernel boot)
     PCIe-->>PCI: Discover FPGA (Vendor ID: 0x10EE)
-    PCI->>PCI: Assign Physical Address to BAR0
+    Note over PCI, PCIe: PCIe Configuration (BAR Sizing & Allocation)
+    PCI->>PCI: Assign Physical Address space for BAR0
+    PCI->>XDMA: PCIe Config Write: Write Physical Addr back to BAR0
     
     Driver->>PCI: module_init() -> pci_register_driver()
     PCI->>Driver: Match ID -> vgpu_probe(pdev)
@@ -34,7 +40,12 @@ sequenceDiagram
     Driver->>PCI: pci_alloc_irq_vectors() (Request MSI/MSI-X)
     Driver->>PCI: request_irq(dev->irq, vgpu_irq_handler)
     
-    Driver->>Driver: dma_alloc_coherent() (Allocate Physical RAM for DMA)
+    Driver->>RAM: dma_alloc_coherent() (Allocate Physical RAM for DMA)
+    RAM-->>Driver: Return Virtual Addr (CPU) & Bus Addr (FPGA)
+    
+    Note over Driver, XDMA: Provide FPGA with the DMA buffer base address
+    Driver->>XDMA: iowrite64(dma_handle, mmio_base + 0x50) (Set DMA Base Address)
+    
     Driver->>VFS: cdev_add(), device_create(/dev/vgpu0)
 
     %% Phase 2: User Initialization
@@ -46,16 +57,22 @@ sequenceDiagram
     App->>VFS: mmap(fd, size)
     VFS->>Driver: vgpu_mmap()
     Driver->>Driver: dma_mmap_coherent() (Map DMA Buffer to User Space PTE)
-    Driver-->>App: User Virtual Address (ptr)
+    Driver-->>App: Map System RAM to User Virtual Address (Zero-copy)
 
     %% Phase 3: Command Submission & Doorbell (PCIe + AXI)
-    Note over App, vGPU_IP: [3] Command Submission & HW Doorbell
-    App->>App: Write Command Data to mapped buffer (ptr)
-    App->>VFS: ioctl(fd, VGPU_IOC_DOORBELL)
+    Note over App, vGPU_IP: [3] Command Submission & HW Doorbell (Atomic Wait)
+    App->>RAM: Write Command Data to mapped buffer (Zero-copy)
+    App->>VFS: ioctl(fd, VGPU_IOC_DOORBELL_AND_WAIT)
     VFS->>Driver: vgpu_ioctl()
+    
+    Note over Driver: Clear irq_fired = 0 (Prevent Lost Wakeup Race)
     
     Note over Driver, PCIe: iowrite32(1, mmio_base + 0x40)
     Driver->>PCIe: Issue Memory Write TLP (Target: BAR0 + 0x40)
+    
+    Driver->>Driver: wait_event_interruptible()
+    Note over App, Driver: Thread goes to SLEEP (Context Switch)
+
     PCIe->>XDMA: Deliver TLP to FPGA Endpoint
     
     Note over XDMA, AXI: PCIe-to-AXI Translation
@@ -63,19 +80,20 @@ sequenceDiagram
     AXI->>vGPU_IP: Route to Custom IP (Offset: slv_reg16)
     
     Note over vGPU_IP: Hardware FSM starts processing!
-    
-    Driver->>Driver: Return from ioctl
-    App->>VFS: ioctl(fd, VGPU_IOC_WAIT_FOR_IRQ)
-    VFS->>Driver: vgpu_ioctl() -> wait_event_interruptible()
-    Note over App, Driver: Thread goes to SLEEP (Context Switch)
 
     %% Phase 4: FPGA DMA & Interrupt
     Note over App, vGPU_IP: [4] Hardware Execution & MSI Interrupt
     vGPU_IP->>XDMA: DMA Read Request (AXI-MM)
     XDMA->>PCIe: Memory Read TLP (Fetch data from Host RAM)
+    PCIe->>RAM: Direct Memory Access (DMA Read)
+    RAM-->>PCIe: Return Data Payload
     PCIe-->>XDMA: Memory Read Completion (Data)
+    
     vGPU_IP->>vGPU_IP: GPU/AI Compute...
+    
     vGPU_IP->>XDMA: DMA Write Request (Write results back)
+    XDMA->>PCIe: Memory Write TLP
+    PCIe->>RAM: Direct Memory Access (DMA Write)
     
     Note over vGPU_IP: Compute Done! Assert usr_irq
     vGPU_IP->>XDMA: Assert Interrupt wire
@@ -93,5 +111,5 @@ sequenceDiagram
     Driver->>Driver: wake_up_interruptible(wait_q)
     Driver-->>PCI: return IRQ_HANDLED (Exit Interrupt Context)
     
-    Driver-->>App: VGPU_IOC_WAIT_FOR_IRQ returns
+    Driver-->>App: VGPU_IOC_DOORBELL_AND_WAIT returns
     Note over App: Thread WAKES UP. Results are ready in memory!
