@@ -214,6 +214,14 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         }
         pr_info("vGPU-Core: Allocated DMA buffer at %p (bus addr: %llx)\n", 
                 dev->data_buffer, (unsigned long long)dev->dma_handle);
+                
+        // tell the FPGA where the DMA buffer is located in System RAM.
+        // otherwise, the FPGA's XDMA IP doesn't know where to Read/Write.
+        // we write the 64-bit Bus Address into two 32-bit registers for compatibility with 32-bit DMA address register.
+        iowrite32(lower_32_bits(dev->dma_handle), dev->mmio_base + VGPU_DMA_ADDR_LOW_OFFSET);
+        iowrite32(upper_32_bits(dev->dma_handle), dev->mmio_base + VGPU_DMA_ADDR_HIGH_OFFSET);
+        pr_info("vGPU-Core: Configured FPGA DMA Base Address to 0x%llx\n", (unsigned long long)dev->dma_handle);
+        
     } else {
         dev->data_buffer = (void *)__get_free_pages(GFP_KERNEL, 0);
         if (!dev->data_buffer) {
