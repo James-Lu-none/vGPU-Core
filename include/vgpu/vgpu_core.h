@@ -28,15 +28,15 @@
  *    AXI-Lite transaction with address (AXI_BASE_ADDR + 0x40) on its M_AXI_LITE port.
  * 4. The Vivado AXI Interconnect (configured via Address Editor) routes this transaction
  *    to our custom AXI-Lite Slave IP.
- * 5. Our custom IP decodes the 0x40 offset (slv_reg16) to trigger the hardware state machine (Doorbell).
+ * 5. Our custom IP decodes the 0x00 offset (slv_reg0) to trigger the hardware state machine (Doorbell).
  * Driver -> PCIe -> XDMA -> AXI Interconnect -> Custom IP
  */
 
-#define VGPU_DOORBELL_OFFSET     0x40
-#define VGPU_INT_STATUS_OFFSET   0x44
-#define VGPU_INT_ACK_OFFSET      0x48
-#define VGPU_DMA_ADDR_LOW_OFFSET  0x50
-#define VGPU_DMA_ADDR_HIGH_OFFSET 0x54
+#define VGPU_DOORBELL_OFFSET      0x00 /* slv_reg0: Trigger DMA */
+#define VGPU_INT_STATUS_OFFSET    0x04 /* slv_reg1: Read IRQ status */
+#define VGPU_INT_ACK_OFFSET       0x08 /* slv_reg2: Clear IRQ status */
+#define VGPU_DMA_ADDR_LOW_OFFSET  0x0C /* slv_reg3: DMA Buffer Bus Address (Lower 32-bit) */
+#define VGPU_DMA_ADDR_HIGH_OFFSET 0x10 /* slv_reg4: DMA Buffer Bus Address (Upper 32-bit) */
 
 #define QUEUE_SIZE 256
 
