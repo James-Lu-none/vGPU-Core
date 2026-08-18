@@ -40,11 +40,15 @@ sequenceDiagram
     Driver->>PCI: pci_alloc_irq_vectors() (Request MSI/MSI-X)
     Driver->>PCI: request_irq(dev->irq, vgpu_irq_handler)
     
-    Driver->>RAM: dma_alloc_coherent() (Allocate Physical RAM for DMA)
+    Driver->>RAM: dma_alloc_coherent() (Allocate Consistent Ring Buffer)
     RAM-->>Driver: Return Virtual Addr (CPU) & Bus Addr (FPGA)
+    Note over Driver, XDMA: Provide FPGA with the Ring Buffer Base Address
+    Driver->>XDMA: iowrite64(dma_handle, mmio_base + 0x0C)
     
-    Note over Driver, XDMA: Provide FPGA with the DMA buffer base address
-    Driver->>XDMA: iowrite64(dma_handle, mmio_base + 0x50) (Set DMA Base Address)
+    Driver->>RAM: __get_free_pages() (Allocate Cached Payload Buffer)
+    Driver->>Driver: dma_map_single() (Streaming DMA Mapping)
+    Note over Driver, XDMA: Provide FPGA with the Payload Base Address
+    Driver->>XDMA: iowrite64(payload_dma_handle, mmio_base + 0x14)
     
     Driver->>VFS: cdev_add(), device_create(/dev/vgpu0)
 
@@ -54,10 +58,15 @@ sequenceDiagram
     VFS->>Driver: vgpu_open() (Allocates vgpu_context)
     Driver-->>App: File Descriptor (fd)
     
-    App->>VFS: mmap(fd, size)
-    VFS->>Driver: vgpu_mmap()
-    Driver->>Driver: dma_mmap_coherent() (Map DMA Buffer to User Space PTE)
-    Driver-->>App: Map System RAM to User Virtual Address (Zero-copy)
+    App->>VFS: mmap(fd, size, offset=0)
+    VFS->>Driver: vgpu_mmap(pgoff=0)
+    Driver->>Driver: dma_mmap_coherent() (Map Ring Buffer)
+    Driver-->>App: Return Ring Buffer Virtual Address
+    
+    App->>VFS: mmap(fd, size, offset=PAGE_SIZE)
+    VFS->>Driver: vgpu_mmap(pgoff=1)
+    Driver->>Driver: remap_pfn_range() (Map Cached Payload Buffer)
+    Driver-->>App: Return Payload Virtual Address
 
     %% Phase 3: Command Submission & Doorbell (PCIe + AXI)
     Note over App, vGPU_IP: [3] Command Submission (Lock-Free) & HW Doorbell
@@ -67,15 +76,18 @@ sequenceDiagram
     App->>RAM: Write Command Data to ring->cmds[tail] (Zero-copy)
     
     Note over App: CPU Producer: Update Tail with Memory Barrier
-    App->>RAM: smp_store_release(&ring->tail) (Ensure data is committed before tail updates)
+    App->>RAM: smp_store_release(&ring->tail) (Ensure command is committed before tail updates!)
     
-    App->>VFS: ioctl(fd, VGPU_IOC_DOORBELL_AND_WAIT)
+    App->>VFS: ioctl(fd, VGPU_IOC_DOORBELL)
     VFS->>Driver: vgpu_ioctl()
     
-    Note over Driver: Clear irq_fired = 0 (Prevent Lost Wakeup Race)
+    Note over Driver: Clear irq_fired = 0 (Prevent Lost Wakeup)
     
-    Note over Driver, PCIe: iowrite32(1, mmio_base + 0x40)
-    Driver->>PCIe: Issue Memory Write TLP (Target: BAR0 + 0x40)
+    Note over Driver, RAM: Streaming DMA: Cache Flush
+    Driver->>RAM: dma_sync_single_for_device() (Flush CPU L1/L2 Cache to Physical RAM)
+    
+    Note over Driver, PCIe: iowrite32(1, mmio_base + 0x00)
+    Driver->>PCIe: Issue Memory Write TLP (Target: BAR0 + 0x00)
     
     Driver->>Driver: wait_event_interruptible()
     Note over App, Driver: Thread goes to SLEEP (Context Switch)
@@ -122,5 +134,9 @@ sequenceDiagram
     Driver->>Driver: wake_up_interruptible(wait_q)
     Driver-->>PCI: return IRQ_HANDLED (Exit Interrupt Context)
     
-    Driver-->>App: VGPU_IOC_DOORBELL_AND_WAIT returns
+    Note over Driver: Wakes up from wait_event_interruptible
+    Note over Driver, RAM: Streaming DMA: Cache Invalidate
+    Driver->>RAM: dma_sync_single_for_cpu() (Invalidate CPU L1/L2 Cache)
+    
+    Driver-->>App: VGPU_IOC_DOORBELL returns
     Note over App: Thread WAKES UP. Results are ready in memory!

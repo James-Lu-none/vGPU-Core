@@ -21,11 +21,9 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 // Protect multiple CPU producer threads from stepping on each other
                 spin_lock(&dev->global_lock);
                 
-                /*
-                 * Lock-Free Memory Barrier: smp_load_acquire()
-                 * Guarantees that we read the most up-to-date 'head' updated by the FPGA DMA.
-                 * Any memory operations after this will not be reordered before it.
-                 */
+                // Lock-Free Memory Barrier: smp_load_acquire()
+                // Guarantees that we read the most up-to-date 'head' updated by the FPGA DMA.
+                // Any memory operations after this will not be reordered before it.
                 head = smp_load_acquire(&dev->ring->head);
                 tail = dev->ring->tail;
                 
@@ -37,12 +35,10 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 // Write the command data into the DMA-mapped Ring Buffer
                 dev->ring->cmds[tail] = user_cmd;
                 
-                /*
-                 * Lock-Free Memory Barrier: smp_store_release()
-                 * CRITICAL: Ensures that the user_cmd is completely committed to System RAM 
-                 * BEFORE we update the tail pointer. If the CPU out-of-order execution writes 
-                 * the tail first, the FPGA might fetch garbage data!
-                 */
+                // Lock-Free Memory Barrier: smp_store_release()
+                // CRITICAL: Ensures that the user_cmd is completely committed to System RAM 
+                // BEFORE we update the tail pointer. If the CPU out-of-order execution writes 
+                // the tail first, the FPGA might fetch garbage data!
                 smp_store_release(&dev->ring->tail, (tail + 1) % QUEUE_SIZE);
                 
                 spin_unlock(&dev->global_lock);
@@ -59,19 +55,36 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             }
             break;
 
-        case VGPU_IOC_DOORBELL_AND_WAIT:
+        case VGPU_IOC_DOORBELL:
             pr_info("vGPU-Core: [Atomic Submit & Wait] Ringing doorbell for vgpu%d...\n", dev->minor);
-            if (dev->data_buffer) {
-                pr_info("vGPU-Core: [Data Path] GPU reading Data Buffer: '%s'\n", (char *)dev->data_buffer);
-            }
 
             // Clear irq_fired BEFORE ringing the doorbell to prevent Lost Wakeup.
             // If the FPGA fires the IRQ instantly, it will set dev->irq_fired = 1.
             // Then wait_event_interruptible will see the 1 and return immediately (no deadlock)
             if (queue_mode == 0) {
                 dev->irq_fired = 0;
+                
+                // Streaming DMA: Cache Flush (Clean)
+                // Before we tell the FPGA to start computing, we MUST flush any 
+                // modified payload data from the CPU's L1/L2 cache out to physical RAM.
+                // If we don't, the FPGA will DMA read stale garbage data from RAM.
+                if (dma_mode == 1 && dev->payload_buffer) {
+                    dma_sync_single_for_device(&dev->pci_dev->dev, dev->payload_dma_handle,
+                                               dev->payload_size, DMA_BIDIRECTIONAL);
+                }
+
                 iowrite32(1, dev->mmio_base + VGPU_DOORBELL_OFFSET);
                 wait_event_interruptible(dev->wait_q, dev->irq_fired != 0);
+                
+                // Streaming DMA: Cache Invalidate
+                // The FPGA has finished computing and DMA-written the results to RAM.
+                // We MUST invalidate the CPU's cache for this region, forcing the CPU 
+                // to fetch the fresh results from RAM instead of reading stale cache lines.
+                if (dma_mode == 1 && dev->payload_buffer) {
+                    dma_sync_single_for_cpu(&dev->pci_dev->dev, dev->payload_dma_handle,
+                                            dev->payload_size, DMA_BIDIRECTIONAL);
+                }
+
                 pr_info("vGPU-Core: [Global Queue] Process woken up by IRQ!\n");
             } else {
                 ctx->irq_fired = 0;

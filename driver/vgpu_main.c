@@ -218,7 +218,33 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         // we write the 64-bit Bus Address into two 32-bit registers for compatibility with 32-bit DMA address register.
         iowrite32(lower_32_bits(dev->dma_handle), dev->mmio_base + VGPU_DMA_ADDR_LOW_OFFSET);
         iowrite32(upper_32_bits(dev->dma_handle), dev->mmio_base + VGPU_DMA_ADDR_HIGH_OFFSET);
-        pr_info("vGPU-Core: Configured FPGA DMA Base Address to 0x%llx\n", (unsigned long long)dev->dma_handle);
+        pr_info("vGPU-Core: Configured FPGA Ring Buffer Base Address to 0x%llx\n", (unsigned long long)dev->dma_handle);
+        
+                 // 2. Data Payload Buffer (Streaming DMA)
+         // We allocate a 1MB standard cached buffer using page allocator.
+        dev->payload_size = 1024 * 1024;
+        dev->payload_buffer = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, get_order(dev->payload_size));
+        if (!dev->payload_buffer) {
+            pr_err("vGPU-Core: failed to allocate payload buffer\n");
+            result = -ENOMEM;
+            goto err_mem_payload;
+        }
+
+                 // Map the buffer to the device for Streaming DMA.
+         // The mapping direction is DMA_BIDIRECTIONAL since CPU and FPGA both read/write to it.
+        dev->payload_dma_handle = dma_map_single(&pdev->dev, dev->payload_buffer, dev->payload_size, DMA_BIDIRECTIONAL);
+        if (dma_mapping_error(&pdev->dev, dev->payload_dma_handle)) {
+            pr_err("vGPU-Core: failed to map payload buffer\n");
+            result = -ENOMEM;
+            goto err_map_payload;
+        }
+        
+        pr_info("vGPU-Core: Allocated Payload buffer at %p (bus addr: %llx)\n", 
+                dev->payload_buffer, (unsigned long long)dev->payload_dma_handle);
+                
+        iowrite32(lower_32_bits(dev->payload_dma_handle), dev->mmio_base + VGPU_PAYLOAD_ADDR_LOW_OFFSET);
+        iowrite32(upper_32_bits(dev->payload_dma_handle), dev->mmio_base + VGPU_PAYLOAD_ADDR_HIGH_OFFSET);
+        pr_info("vGPU-Core: Configured FPGA Payload Base Address to 0x%llx\n", (unsigned long long)dev->payload_dma_handle);
         
     } else {
         dev->data_buffer = (void *)__get_free_pages(GFP_KERNEL, 0);
@@ -245,7 +271,7 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     result = request_irq(dev->irq, vgpu_irq_handler, 0, "vgpu_irq", dev);
     if (result) {
         pr_err("vGPU-Core: failed to request IRQ %d\n", dev->irq);
-        goto err_mem;
+        goto err_irq;
     }
 
     /*
@@ -280,10 +306,22 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 err_cdev:
     cdev_del(&dev->cdev);
+err_irq:
     free_irq(dev->irq, dev);
+    if (dma_mode == 1) {
+        dma_unmap_single(&pdev->dev, dev->payload_dma_handle, dev->payload_size, DMA_BIDIRECTIONAL);
+    }
+err_map_payload:
+    if (dma_mode == 1) {
+        free_pages((unsigned long)dev->payload_buffer, get_order(dev->payload_size));
+    }
+err_mem_payload:
 err_mem:
-    if (dma_mode == 1) dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->data_buffer, dev->dma_handle);
-    else free_pages((unsigned long)dev->data_buffer, 0);
+    if (dma_mode == 1) {
+        dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->data_buffer, dev->dma_handle);
+    } else {
+        free_pages((unsigned long)dev->data_buffer, 0);
+    }
 err_iounmap:
     pci_iounmap(pdev, dev->mmio_base);
 err_free:
@@ -309,6 +347,8 @@ static void vgpu_remove(struct pci_dev *pdev)
         cdev_del(&dev->cdev);
 
         if (dma_mode == 1) {
+            dma_unmap_single(&pdev->dev, dev->payload_dma_handle, dev->payload_size, DMA_BIDIRECTIONAL);
+            free_pages((unsigned long)dev->payload_buffer, get_order(dev->payload_size));
             dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->data_buffer, dev->dma_handle);
         } else {
             free_pages((unsigned long)dev->data_buffer, 0);

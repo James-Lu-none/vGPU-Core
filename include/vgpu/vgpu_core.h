@@ -84,8 +84,12 @@ struct vgpu_dev {
     wait_queue_head_t wait_q;
     int irq_fired;
 
-    void *data_buffer;
+    void *data_buffer;           // Ring Buffer (Consistent DMA)
     dma_addr_t dma_handle;
+
+    void *payload_buffer;        // Data Payload (Cached memory, Streaming DMA)
+    dma_addr_t payload_dma_handle;
+    size_t payload_size;
 };
 
 #define MAX_VGPU_DEVICES 4
