@@ -46,7 +46,8 @@ sequenceDiagram
     Driver->>XDMA: iowrite64(dma_handle, mmio_base + 0x0C)
     
     Driver->>RAM: dma_alloc_coherent() (Allocate Software Page Table)
-    Note over Driver, XDMA: Provide FPGA with the Page Table Base Address
+    Note over Driver, XDMA: Provide FPGA with UVM Mode & Page Table Base Address
+    Driver->>XDMA: iowrite32(uvm_mode, mmio_base + 0x20)
     Driver->>XDMA: iowrite64(page_table_dma, mmio_base + 0x14)
     
     Driver->>VFS: cdev_add(), device_create(/dev/vgpu0)
@@ -70,10 +71,16 @@ sequenceDiagram
     
     App->>VFS: ioctl(fd, VGPU_IOC_SUBMIT_CMD, &user_cmd)
     VFS->>Driver: vgpu_ioctl()
-    Note over Driver, RAM: Demand Paging & Scatter-Gather
+    Note over Driver, RAM: Unified Memory Setup (Demand Paging)
     Driver->>RAM: get_user_pages_fast(user_vaddr) (Lock/Pin User Pages)
-    Driver->>Driver: dma_map_page() (Map each pinned page)
-    Driver->>RAM: Write mapped DMA addresses into Coherent Page Table
+    
+    alt uvm_mode == 0 (IOMMU Contiguous)
+        Driver->>Driver: dma_map_sg() (Request IOMMU to coalesce pages)
+        Driver->>XDMA: Provide single IOVA payload address to 0x14
+    else uvm_mode == 1 (Scatter-Gather)
+        Driver->>Driver: dma_map_page() (Map each pinned page)
+        Driver->>RAM: Write mapped DMA addresses into Coherent Page Table
+    end
     
     Driver->>RAM: Write Command Data to ring->cmds[tail] (Zero-copy)
     
@@ -136,7 +143,11 @@ sequenceDiagram
     
     Note over Driver: Wakes up from wait_event_interruptible
     Note over Driver, RAM: Unified Memory Teardown
-    Driver->>Driver: dma_unmap_page() (Unmap Scatter-Gather Pages)
+    alt uvm_mode == 0
+        Driver->>Driver: dma_unmap_sg() (Unmap IOVA)
+    else uvm_mode == 1
+        Driver->>Driver: dma_unmap_page() (Unmap Scatter-Gather Pages)
+    end
     Driver->>RAM: put_page() (Unpin/Release physical pages)
     
     Driver-->>App: VGPU_IOC_DOORBELL returns

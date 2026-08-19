@@ -15,6 +15,7 @@
 #include <linux/mm.h>
 #include <linux/delay.h>
 #include <linux/pci.h>
+#include <linux/scatterlist.h>
 #include "../uapi/vgpu_ioctl.h"
 
 /*
@@ -39,6 +40,7 @@
 #define VGPU_DMA_ADDR_HIGH_OFFSET 0x10 /* slv_reg4: DMA Buffer Bus Address (Upper 32-bit) */
 #define VGPU_PAYLOAD_ADDR_LOW_OFFSET  0x14 /* slv_reg5: Page Table Base Address (Lower 32-bit) */
 #define VGPU_PAYLOAD_ADDR_HIGH_OFFSET 0x18 /* slv_reg6: Page Table Base Address (Upper 32-bit) */
+#define VGPU_UVM_MODE_OFFSET          0x20 /* slv_reg7: 0=Direct/IOMMU, 1=Scatter-Gather */
 
 #define QUEUE_SIZE 256
 
@@ -56,6 +58,7 @@ struct vgpu_ring_buffer {
 
 extern int queue_mode;
 extern int dma_mode;
+extern int uvm_mode;
 
 struct vgpu_context {
     // for one vgpu, each open context only needs the private queue
@@ -91,8 +94,11 @@ struct vgpu_dev {
 
     dma_addr_t *page_table;      // Page Table (Array of dma_addr_t)
     dma_addr_t page_table_dma;   // Bus Address of the Page Table
-    struct page *pinned_pages[512]; // Array to hold pinned pages (Max 2MB payload)
+    struct page **pinned_pages;  // Array to hold pinned pages (Max 32MB payload)
     int num_pinned_pages;
+    
+    struct scatterlist *sgl;     // For IOMMU dma_map_sg (IOVA i/o virtual address)
+    int sgl_nents;               // Number of SG entries returned by dma_map_sg
 };
 
 #define MAX_VGPU_DEVICES 4

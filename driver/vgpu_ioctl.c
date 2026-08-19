@@ -24,7 +24,7 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                  * 3. Lock/Pin these pages in physical RAM so they don't get swapped out.
                  */
                 int num_pages = (user_cmd.payload_size + PAGE_SIZE - 1) / PAGE_SIZE;
-                if (num_pages > 512) return -EINVAL; // Max 2MB for our demo
+                if (num_pages > 8192) return -EINVAL; // Max 32MB for our demo
                 
                 dev->num_pinned_pages = get_user_pages_fast(user_cmd.payload_vaddr, num_pages, 
                                                             FOLL_WRITE, dev->pinned_pages);
@@ -33,20 +33,45 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                     return dev->num_pinned_pages;
                 }
                 
-                /*
-                 * Scatter-Gather Mapping:
-                 * Map each individual scattered physical page to the DMA bus.
-                 * Write the resulting Bus Addresses into our coherent Page Table buffer.
-                 * The FPGA will read this Page Table to locate the scattered data.
-                 */
-                for (int i = 0; i < dev->num_pinned_pages; i++) {
-                    dma_addr_t dma_addr = dma_map_page(&dev->pci_dev->dev, dev->pinned_pages[i], 
-                                                       0, PAGE_SIZE, DMA_BIDIRECTIONAL);
-                    if (dma_mapping_error(&dev->pci_dev->dev, F)) {
-                        pr_err("vGPU-Core: dma_map_page failed\n");
+                if (uvm_mode == 0) {
+                    /* IOMMU Contiguous Mode */
+                    dev->sgl = kmalloc_array(dev->num_pinned_pages, sizeof(struct scatterlist), GFP_KERNEL);
+                    if (!dev->sgl) return -ENOMEM;
+                    
+                    sg_init_table(dev->sgl, dev->num_pinned_pages);
+                    for (int i = 0; i < dev->num_pinned_pages; i++) {
+                        sg_set_page(&dev->sgl[i], dev->pinned_pages[i], PAGE_SIZE, 0);
+                    }
+                    
+                    dev->sgl_nents = dma_map_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
+                    if (dev->sgl_nents == 0) {
+                        pr_err("vGPU-Core: dma_map_sg failed\n");
+                        kfree(dev->sgl);
                         return -ENOMEM;
                     }
-                    dev->page_table[i] = dma_addr;
+                    
+                    if (dev->sgl_nents != 1) {
+                        pr_err("vGPU-Core: IOMMU failed to coalesce pages into a single chunk. Host lacks IOMMU or it is disabled.\n");
+                        dma_unmap_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
+                        kfree(dev->sgl);
+                        return -ENOTSUPP;
+                    }
+                    
+                    // Write the single contiguous IOVA to the FPGA
+                    dma_addr_t contiguous_iova = sg_dma_address(&dev->sgl[0]);
+                    iowrite32(lower_32_bits(contiguous_iova), dev->mmio_base + VGPU_PAYLOAD_ADDR_LOW_OFFSET);
+                    iowrite32(upper_32_bits(contiguous_iova), dev->mmio_base + VGPU_PAYLOAD_ADDR_HIGH_OFFSET);
+                } else {
+                    /* Scatter-Gather Page Table Mode */
+                    for (int i = 0; i < dev->num_pinned_pages; i++) {
+                        dma_addr_t dma_addr = dma_map_page(&dev->pci_dev->dev, dev->pinned_pages[i], 
+                                                           0, PAGE_SIZE, DMA_BIDIRECTIONAL);
+                        if (dma_mapping_error(&dev->pci_dev->dev, dma_addr)) {
+                            pr_err("vGPU-Core: dma_map_page failed\n");
+                            return -ENOMEM;
+                        }
+                        dev->page_table[i] = dma_addr;
+                    }
                 }
                 pr_info("vGPU-Core: Demand Paging: Pinned %d pages and built Page Table\n", dev->num_pinned_pages);
             }
@@ -125,17 +150,25 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 /*
                  * Unified Memory: Teardown
                  * The FPGA has finished computing. We must unmap the DMA addresses
-                 * and release (put_page) the locked physical pages so Linux can 
-                 * swap them out or free them if necessary.
+                 * and put (unpin) the user pages so Linux can manage them again.
                  */
-                if (dev->num_pinned_pages > 0) {
+                if (uvm_mode == 0) {
+                    if (dev->sgl) {
+                        dma_unmap_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
+                        kfree(dev->sgl);
+                        dev->sgl = NULL;
+                    }
+                } else {
                     for (int i = 0; i < dev->num_pinned_pages; i++) {
                         dma_unmap_page(&dev->pci_dev->dev, dev->page_table[i], PAGE_SIZE, DMA_BIDIRECTIONAL);
-                        put_page(dev->pinned_pages[i]);
                     }
-                    pr_info("vGPU-Core: Unified Memory: Unmapped and unpinned %d pages\n", dev->num_pinned_pages);
-                    dev->num_pinned_pages = 0;
                 }
+                
+                for (int i = 0; i < dev->num_pinned_pages; i++) {
+                    put_page(dev->pinned_pages[i]);
+                }
+                pr_info("vGPU-Core: Unified Memory: Unmapped and unpinned %d pages\n", dev->num_pinned_pages);
+                dev->num_pinned_pages = 0;
 
                 pr_info("vGPU-Core: [Global Queue] Process woken up by IRQ!\n");
             } else {
