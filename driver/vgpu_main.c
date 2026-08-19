@@ -203,61 +203,57 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         // see page 376 at https://bootlin.com/doc/training/linux-kernel/linux-kernel-slides.pdf
         dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
         
-        dev->data_buffer = dma_alloc_coherent(&pdev->dev, PAGE_SIZE, 
+        dev->ring_buffer = dma_alloc_coherent(&pdev->dev, PAGE_SIZE, 
                                               &dev->dma_handle, GFP_KERNEL);
-        if (!dev->data_buffer) {
+        if (!dev->ring_buffer) {
             pr_err("vGPU-Core: failed to allocate DMA memory\n");
             result = -ENOMEM;
             goto err_iounmap;
         }
         pr_info("vGPU-Core: Allocated DMA buffer at %p (bus addr: %llx)\n", 
-                dev->data_buffer, (unsigned long long)dev->dma_handle);
+                dev->ring_buffer, (unsigned long long)dev->dma_handle);
                 
         // tell the FPGA where the DMA buffer is located in System RAM.
         // otherwise, the FPGA's XDMA IP doesn't know where to Read/Write.
         // we write the 64-bit Bus Address into two 32-bit registers for compatibility with 32-bit DMA address register.
+        // this dma memory is for command queue
         iowrite32(lower_32_bits(dev->dma_handle), dev->mmio_base + VGPU_DMA_ADDR_LOW_OFFSET);
         iowrite32(upper_32_bits(dev->dma_handle), dev->mmio_base + VGPU_DMA_ADDR_HIGH_OFFSET);
         pr_info("vGPU-Core: Configured FPGA Ring Buffer Base Address to 0x%llx\n", (unsigned long long)dev->dma_handle);
         
-                 // 2. Data Payload Buffer (Streaming DMA)
-         // We allocate a 1MB standard cached buffer using page allocator.
-        dev->payload_size = 1024 * 1024;
-        dev->payload_buffer = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, get_order(dev->payload_size));
-        if (!dev->payload_buffer) {
-            pr_err("vGPU-Core: failed to allocate payload buffer\n");
+        // 2. Software Page Table (Unified Memory)
+        // allocate a 1-Page Coherent DMA buffer to store the Page Table.
+        // The driver will pin user pages and write their DMA addresses here.
+        // The FPGA will read this Page Table to know where the scattered pages are.
+        dev->page_table = dma_alloc_coherent(&pdev->dev, PAGE_SIZE, 
+                                             &dev->page_table_dma, GFP_KERNEL);
+        if (!dev->page_table) {
+            pr_err("vGPU-Core: failed to allocate page table buffer\n");
             result = -ENOMEM;
-            goto err_mem_payload;
+            goto err_mem_pt;
         }
 
-                 // Map the buffer to the device for Streaming DMA.
-         // The mapping direction is DMA_BIDIRECTIONAL since CPU and FPGA both read/write to it.
-        dev->payload_dma_handle = dma_map_single(&pdev->dev, dev->payload_buffer, dev->payload_size, DMA_BIDIRECTIONAL);
-        if (dma_mapping_error(&pdev->dev, dev->payload_dma_handle)) {
-            pr_err("vGPU-Core: failed to map payload buffer\n");
-            result = -ENOMEM;
-            goto err_map_payload;
-        }
-        
-        pr_info("vGPU-Core: Allocated Payload buffer at %p (bus addr: %llx)\n", 
-                dev->payload_buffer, (unsigned long long)dev->payload_dma_handle);
+        pr_info("vGPU-Core: Allocated Page Table buffer at %p (bus addr: %llx)\n", 
+                dev->page_table, (unsigned long long)dev->page_table_dma);
                 
-        iowrite32(lower_32_bits(dev->payload_dma_handle), dev->mmio_base + VGPU_PAYLOAD_ADDR_LOW_OFFSET);
-        iowrite32(upper_32_bits(dev->payload_dma_handle), dev->mmio_base + VGPU_PAYLOAD_ADDR_HIGH_OFFSET);
-        pr_info("vGPU-Core: Configured FPGA Payload Base Address to 0x%llx\n", (unsigned long long)dev->payload_dma_handle);
+        // Tell the FPGA where the Page Table is located
+        iowrite32(lower_32_bits(dev->page_table_dma), dev->mmio_base + VGPU_PAYLOAD_ADDR_LOW_OFFSET);
+        iowrite32(upper_32_bits(dev->page_table_dma), dev->mmio_base + VGPU_PAYLOAD_ADDR_HIGH_OFFSET);
+        pr_info("vGPU-Core: Configured FPGA Page Table Base Address to 0x%llx\n", (unsigned long long)dev->page_table_dma);
         
     } else {
-        dev->data_buffer = (void *)__get_free_pages(GFP_KERNEL, 0);
-        if (!dev->data_buffer) {
+        dev->ring_buffer = (void *)__get_free_pages(GFP_KERNEL, 0);
+        if (!dev->ring_buffer) {
             pr_err("vGPU-Core: failed to allocate pages\n");
             result = -ENOMEM;
             goto err_iounmap;
         }
         pr_info("vGPU-Core: Allocated pure software page buffer at %p\n", 
-                dev->data_buffer);
+                dev->ring_buffer);
+        
     }
 
-    dev->ring = (struct vgpu_ring_buffer *)dev->data_buffer;
+    dev->ring = (struct vgpu_ring_buffer *)dev->ring_buffer;
     dev->ring->head = 0;
     dev->ring->tail = 0;
 
@@ -308,19 +304,15 @@ err_cdev:
     cdev_del(&dev->cdev);
 err_irq:
     free_irq(dev->irq, dev);
+err_mem_pt:
     if (dma_mode == 1) {
-        dma_unmap_single(&pdev->dev, dev->payload_dma_handle, dev->payload_size, DMA_BIDIRECTIONAL);
+        dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->page_table, dev->page_table_dma);
     }
-err_map_payload:
-    if (dma_mode == 1) {
-        free_pages((unsigned long)dev->payload_buffer, get_order(dev->payload_size));
-    }
-err_mem_payload:
 err_mem:
     if (dma_mode == 1) {
-        dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->data_buffer, dev->dma_handle);
+        dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->ring_buffer, dev->dma_handle);
     } else {
-        free_pages((unsigned long)dev->data_buffer, 0);
+        free_pages((unsigned long)dev->ring_buffer, 0);
     }
 err_iounmap:
     pci_iounmap(pdev, dev->mmio_base);
@@ -347,11 +339,10 @@ static void vgpu_remove(struct pci_dev *pdev)
         cdev_del(&dev->cdev);
 
         if (dma_mode == 1) {
-            dma_unmap_single(&pdev->dev, dev->payload_dma_handle, dev->payload_size, DMA_BIDIRECTIONAL);
-            free_pages((unsigned long)dev->payload_buffer, get_order(dev->payload_size));
-            dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->data_buffer, dev->dma_handle);
+            dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->page_table, dev->page_table_dma);
+            dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->ring_buffer, dev->dma_handle);
         } else {
-            free_pages((unsigned long)dev->data_buffer, 0);
+            free_pages((unsigned long)dev->ring_buffer, 0);
         }
 
         if (dev->mmio_base) {

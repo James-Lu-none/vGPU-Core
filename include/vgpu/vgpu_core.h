@@ -37,6 +37,8 @@
 #define VGPU_INT_ACK_OFFSET       0x08 /* slv_reg2: Clear IRQ status */
 #define VGPU_DMA_ADDR_LOW_OFFSET  0x0C /* slv_reg3: DMA Buffer Bus Address (Lower 32-bit) */
 #define VGPU_DMA_ADDR_HIGH_OFFSET 0x10 /* slv_reg4: DMA Buffer Bus Address (Upper 32-bit) */
+#define VGPU_PAYLOAD_ADDR_LOW_OFFSET  0x14 /* slv_reg5: Page Table Base Address (Lower 32-bit) */
+#define VGPU_PAYLOAD_ADDR_HIGH_OFFSET 0x18 /* slv_reg6: Page Table Base Address (Upper 32-bit) */
 
 #define QUEUE_SIZE 256
 
@@ -75,7 +77,7 @@ struct vgpu_dev {
     void __iomem *mmio_base; // Mapped PCIe Base Address Register 0 (BAR0) address
     int irq;                 // The IRQ number allocated by the PCI subsystem for this device
 
-    struct vgpu_ring_buffer *ring; // Points to data_buffer (used as global queue)
+    struct vgpu_ring_buffer *ring; // Points to ring_buffer (used as global queue)
     spinlock_t global_lock;        // Lock among multiple CPU producers (threads)
 
     struct list_head ctx_list;
@@ -84,12 +86,13 @@ struct vgpu_dev {
     wait_queue_head_t wait_q;
     int irq_fired;
 
-    void *data_buffer;           // Ring Buffer (Consistent DMA)
+    void *ring_buffer;           // Ring Buffer (Consistent DMA)
     dma_addr_t dma_handle;
 
-    void *payload_buffer;        // Data Payload (Cached memory, Streaming DMA)
-    dma_addr_t payload_dma_handle;
-    size_t payload_size;
+    dma_addr_t *page_table;      // Page Table (Array of dma_addr_t)
+    dma_addr_t page_table_dma;   // Bus Address of the Page Table
+    struct page *pinned_pages[512]; // Array to hold pinned pages (Max 2MB payload)
+    int num_pinned_pages;
 };
 
 #define MAX_VGPU_DEVICES 4

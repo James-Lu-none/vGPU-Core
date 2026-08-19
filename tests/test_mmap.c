@@ -25,43 +25,50 @@ int main(int argc, char **argv) {
     }
     printf("[User Space] Mapped Command Queue at %p\n", ring_ptr);
 
-    // 2. Map the Data Payload (1MB) -> offset 1 page
-    size_t payload_size = 1024 * 1024;
-    void *payload_ptr = mmap(NULL, payload_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 4096);
-    if (payload_ptr == MAP_FAILED) {
-        perror("mmap payload buffer error");
+    // 2. Allocate Data Payload using standard malloc (Demand Paging)
+    // before implementing demand paging, the memory was allocated and own by gpu with dma_alloc_coherent() in probe function
+    // and userspace side has to perform dma_mmap_coherent to map the memory that gpu is holding and read/write data from/to the memory
+    // !Now, with demand paging, the userspace side can just perform malloc, which only allocate virtual address space initially
+    // and kernel will allocate physical memory when the userspace side access the memory, also, we pass this virtual address to
+    // into cmd over ioctl, and the driver performs get_user_pages_fast() to tell kernel to pin the physical memmory and provide the phsical address
+    // for  
+    size_t payload_size = 1024 * 1024; // 1MB
+    void *payload_ptr = malloc(payload_size);
+    if (!payload_ptr) {
+        perror("malloc payload buffer error");
         munmap(ring_ptr, MMAP_SIZE);
         close(fd);
         return -1;
     }
-    printf("[User Space] Mapped Data Payload at %p\n", payload_ptr);
+    printf("[User Space] Allocated Data Payload (Virtual Address) at %p\n", payload_ptr);
 
     // Write massive data to payload buffer (simulating AI weights / images)
-    const char *msg = "Hello from User Space! This is a massive 1MB Payload for Streaming DMA.";
+    // This write operation triggers Linux CPU Page Faults, allocating physical RAM on-demand!
+    const char *msg = "Hello from User Space! This is a massive 1MB Payload for Demand Paging (UVM).";
     strcpy((char *)payload_ptr, msg);
     printf("[User Space] Wrote data to Payload Buffer: '%s'\n", msg);
 
-    // 準備一個 Command
+    // Prepare a Command
     struct vgpu_command cmd = {
         .opcode = 1,
-        .operand1 = 100,
-        .operand2 = 200,
-        .result = 0
+        .payload_size = payload_size,
+        .payload_vaddr = (unsigned long)payload_ptr
     };
 
     // 發送 Command (Control Path)
+    // The Kernel will pin the memory and build a Scatter-Gather Page Table for the FPGA
     if (ioctl(fd, VGPU_IOC_SUBMIT_CMD, &cmd) < 0) {
         perror("ioctl VGPU_IOC_SUBMIT_CMD error");
     }
 
     // 敲響 Doorbell 告訴 Kernel/GPU 資料準備好了
-    printf("[User Space] Ringing Doorbell & Triggering dma_sync_single_for_device...\n");
+    printf("[User Space] Ringing Doorbell...\n");
     if (ioctl(fd, VGPU_IOC_DOORBELL, 1) < 0) {
         perror("ioctl VGPU_IOC_DOORBELL error");
     }
 
     // 解除映射並關閉檔案
-    munmap(payload_ptr, payload_size);
+    free(payload_ptr);
     munmap(ring_ptr, MMAP_SIZE);
     close(fd);
     return 0;

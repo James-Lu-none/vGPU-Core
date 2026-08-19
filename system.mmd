@@ -45,10 +45,9 @@ sequenceDiagram
     Note over Driver, XDMA: Provide FPGA with the Ring Buffer Base Address
     Driver->>XDMA: iowrite64(dma_handle, mmio_base + 0x0C)
     
-    Driver->>RAM: __get_free_pages() (Allocate Cached Payload Buffer)
-    Driver->>Driver: dma_map_single() (Streaming DMA Mapping)
-    Note over Driver, XDMA: Provide FPGA with the Payload Base Address
-    Driver->>XDMA: iowrite64(payload_dma_handle, mmio_base + 0x14)
+    Driver->>RAM: dma_alloc_coherent() (Allocate Software Page Table)
+    Note over Driver, XDMA: Provide FPGA with the Page Table Base Address
+    Driver->>XDMA: iowrite64(page_table_dma, mmio_base + 0x14)
     
     Driver->>VFS: cdev_add(), device_create(/dev/vgpu0)
 
@@ -63,28 +62,29 @@ sequenceDiagram
     Driver->>Driver: dma_mmap_coherent() (Map Ring Buffer)
     Driver-->>App: Return Ring Buffer Virtual Address
     
-    App->>VFS: mmap(fd, size, offset=PAGE_SIZE)
-    VFS->>Driver: vgpu_mmap(pgoff=1)
-    Driver->>Driver: remap_pfn_range() (Map Cached Payload Buffer)
-    Driver-->>App: Return Payload Virtual Address
+    App->>RAM: malloc() (User Space Memory Allocation)
+    Note over App: CPU Page Faults occur when App writes to malloc memory (Demand Paging!)
 
     %% Phase 3: Command Submission & Doorbell (PCIe + AXI)
-    Note over App, vGPU_IP: [3] Command Submission (Lock-Free) & HW Doorbell
-    Note over App: CPU Producer: Check if Queue is Full
-    App->>RAM: smp_load_acquire(&ring->head) (Read FPGA's head safely)
+    Note over App, vGPU_IP: [3] Command Submission (Lock-Free) & Unified Memory
     
-    App->>RAM: Write Command Data to ring->cmds[tail] (Zero-copy)
+    App->>VFS: ioctl(fd, VGPU_IOC_SUBMIT_CMD, &user_cmd)
+    VFS->>Driver: vgpu_ioctl()
+    Note over Driver, RAM: Demand Paging & Scatter-Gather
+    Driver->>RAM: get_user_pages_fast(user_vaddr) (Lock/Pin User Pages)
+    Driver->>Driver: dma_map_page() (Map each pinned page)
+    Driver->>RAM: Write mapped DMA addresses into Coherent Page Table
     
-    Note over App: CPU Producer: Update Tail with Memory Barrier
-    App->>RAM: smp_store_release(&ring->tail) (Ensure command is committed before tail updates!)
+    Driver->>RAM: Write Command Data to ring->cmds[tail] (Zero-copy)
+    
+    Note over Driver: CPU Producer: Update Tail with Memory Barrier
+    Driver->>RAM: smp_store_release(&ring->tail) (Ensure command is committed before tail updates!)
+    Driver-->>App: VGPU_IOC_SUBMIT_CMD returns
     
     App->>VFS: ioctl(fd, VGPU_IOC_DOORBELL)
     VFS->>Driver: vgpu_ioctl()
     
     Note over Driver: Clear irq_fired = 0 (Prevent Lost Wakeup)
-    
-    Note over Driver, RAM: Streaming DMA: Cache Flush
-    Driver->>RAM: dma_sync_single_for_device() (Flush CPU L1/L2 Cache to Physical RAM)
     
     Note over Driver, PCIe: iowrite32(1, mmio_base + 0x00)
     Driver->>PCIe: Issue Memory Write TLP (Target: BAR0 + 0x00)
@@ -135,8 +135,9 @@ sequenceDiagram
     Driver-->>PCI: return IRQ_HANDLED (Exit Interrupt Context)
     
     Note over Driver: Wakes up from wait_event_interruptible
-    Note over Driver, RAM: Streaming DMA: Cache Invalidate
-    Driver->>RAM: dma_sync_single_for_cpu() (Invalidate CPU L1/L2 Cache)
+    Note over Driver, RAM: Unified Memory Teardown
+    Driver->>Driver: dma_unmap_page() (Unmap Scatter-Gather Pages)
+    Driver->>RAM: put_page() (Unpin/Release physical pages)
     
     Driver-->>App: VGPU_IOC_DOORBELL returns
     Note over App: Thread WAKES UP. Results are ready in memory!

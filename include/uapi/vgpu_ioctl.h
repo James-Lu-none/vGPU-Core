@@ -17,10 +17,9 @@
  * 為了跨平台(32/64 bit)相容，我們使用 __u32 等固定大小的型別。
  */
 struct vgpu_command {
-    __u32 opcode;    // 運算類型 (例如：1=相加, 2=相乘)
-    __u32 operand1;  // 操作數 1
-    __u32 operand2;  // 操作數 2
-    __u32 result;    // 運算結果 (未來虛擬硬體算完後填入)
+    __u32 opcode;         // 運算類型 (例如：1=相加, 2=相乘)
+    __u32 payload_size;   // Data size in bytes (e.g. 1048576 for 1MB)
+    __u64 payload_vaddr;  // User Space Virtual Address of the payload
 };
 
 
