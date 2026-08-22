@@ -58,7 +58,6 @@ struct vgpu_ring_buffer {
 
 extern int queue_mode;
 extern int dma_mode;
-extern int uvm_mode;
 
 struct vgpu_context {
     // for one vgpu, each open context only needs the private queue
@@ -70,6 +69,20 @@ struct vgpu_context {
     int irq_fired;
     struct list_head list_node;
 };
+
+/*
+ * XDMA Hardware Descriptor Format (32-byte aligned)
+ */
+struct xdma_desc {
+    u32 control;         /* Magic (0xAD4B0000), EOP (bit 0), IRQ (bit 1) */
+    u32 bytes;           /* Transfer size in bytes */
+    u64 src_addr;        /* Source DMA Address (Host System RAM) */
+    u64 dst_addr;        /* Destination AXI Address (FPGA internal buffer) */
+    u64 next_desc;       /* Next Descriptor DMA Address (Host System RAM) */
+} __packed;
+
+#define XDMA_DESC_MAGIC 0xAD4B0000
+#define XDMA_DESC_EOP   (1u << 0)
 
 struct vgpu_dev {
     // use minor number to identify each vgpu device in /dev/vgpuX
@@ -92,12 +105,12 @@ struct vgpu_dev {
     void *ring_buffer;           // Ring Buffer (Consistent DMA)
     dma_addr_t dma_handle;
 
-    dma_addr_t *page_table;      // Page Table (Array of dma_addr_t)
-    dma_addr_t page_table_dma;   // Bus Address of the Page Table
+    struct xdma_desc *desc_ring; // XDMA Descriptor Ring (Coherent DMA Buffer)
+    dma_addr_t desc_ring_dma_addr; // Bus Address of XDMA Descriptor Ring
     struct page **pinned_pages;  // Array to hold pinned pages (Max 32MB payload)
     int num_pinned_pages;
     
-    struct scatterlist *sgl;     // For IOMMU dma_map_sg (IOVA i/o virtual address)
+    struct scatterlist *sgl;     // For dma_map_sg (Scatter-Gather DMA)
     int sgl_nents;               // Number of SG entries returned by dma_map_sg
 };
 

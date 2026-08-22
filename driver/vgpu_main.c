@@ -9,10 +9,6 @@ int dma_mode = 0;
 module_param(dma_mode, int, 0644);
 MODULE_PARM_DESC(dma_mode, "0: Software MMAP, 1: DMA API");
 
-int uvm_mode = 1;
-module_param(uvm_mode, int, 0644);
-MODULE_PARM_DESC(uvm_mode, "0 = IOMMU Contiguous (Option B), 1 = Scatter-Gather Page Table (Option A)");
-
 struct class *g_vgpu_class = NULL;
 
 // vgpu_dev_num is outside of vgpu_dev structure since dev_t contains
@@ -225,33 +221,21 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
         iowrite32(upper_32_bits(dev->dma_handle), dev->mmio_base + VGPU_DMA_ADDR_HIGH_OFFSET);
         pr_info("vGPU-Core: Configured FPGA Ring Buffer Base Address to 0x%llx\n", (unsigned long long)dev->dma_handle);
         
-        // Notify the FPGA which UVM mode we are using
-        iowrite32(uvm_mode, dev->mmio_base + VGPU_UVM_MODE_OFFSET);
-        pr_info("vGPU-Core: Configured FPGA UVM Mode to %d\n", uvm_mode);
-        
-        if (uvm_mode == 1) {
-            // 2. Software Page Table (Unified Memory)
-            // allocate a 64KB Coherent DMA buffer to store the Page Table.
-            // The driver will pin user pages and write their DMA addresses here.
-            // 64KB / 8 bytes = 8192 entries (supports up to 32MB payload)
-            dev->page_table = dma_alloc_coherent(&pdev->dev, 64 * 1024, 
-                                                 &dev->page_table_dma, GFP_KERNEL);
-            if (!dev->page_table) {
-                pr_err("vGPU-Core: failed to allocate page table buffer\n");
-                result = -ENOMEM;
-                goto err_mem_pt;
-            }
-
-            pr_info("vGPU-Core: Allocated Page Table buffer at %p (bus addr: %llx)\n", 
-                    dev->page_table, (unsigned long long)dev->page_table_dma);
-                    
-            // Tell the FPGA where the Page Table is located
-            iowrite32(lower_32_bits(dev->page_table_dma), dev->mmio_base + VGPU_PAYLOAD_ADDR_LOW_OFFSET);
-            iowrite32(upper_32_bits(dev->page_table_dma), dev->mmio_base + VGPU_PAYLOAD_ADDR_HIGH_OFFSET);
-            pr_info("vGPU-Core: Configured FPGA Page Table Base Address to 0x%llx\n", (unsigned long long)dev->page_table_dma);
+        // Allocate 64KB Coherent DMA memory for XDMA Descriptor Ring (8192 descriptors)
+        // this memory is for storing the descriptor ring that will be sent to FPGA, 
+        // 64KB / 8 bytes = 8192 entries (supports up to 32MB payload)
+        dev->desc_ring = dma_alloc_coherent(&pdev->dev, 8192 * sizeof(struct xdma_desc),
+                                             &dev->desc_ring_dma_addr, GFP_KERNEL);
+        if (!dev->desc_ring) {
+            pr_err("vGPU-Core: failed to allocate XDMA descriptor ring buffer\n");
+            result = -ENOMEM;
+            goto err_mem_pt;
         }
+
+        pr_info("vGPU-Core: Allocated XDMA Descriptor Ring at %p (bus addr: %llx)\n", 
+                dev->desc_ring, (unsigned long long)dev->desc_ring_dma_addr);
         
-        // Allocate array for pinned pages (8192 entries = 64KB)
+        // Allocate array for pointers to the pinned pages (8192 entries)
         dev->pinned_pages = kzalloc(8192 * sizeof(struct page *), GFP_KERNEL);
         if (!dev->pinned_pages) {
             pr_err("vGPU-Core: failed to allocate pinned_pages array\n");
@@ -325,7 +309,7 @@ err_irq:
 err_mem_pt:
     if (dma_mode == 1) {
         if (dev->pinned_pages) kfree(dev->pinned_pages);
-        if (dev->page_table && uvm_mode == 1) dma_free_coherent(&pdev->dev, 64 * 1024, dev->page_table, dev->page_table_dma);
+        if (dev->desc_ring) dma_free_coherent(&pdev->dev, 8192 * sizeof(struct xdma_desc), dev->desc_ring, dev->desc_ring_dma_addr);
     }
 err_mem:
     if (dma_mode == 1) {
@@ -359,8 +343,8 @@ static void vgpu_remove(struct pci_dev *pdev)
 
         if (dma_mode == 1) {
             kfree(dev->pinned_pages);
-            if (uvm_mode == 1 && dev->page_table) {
-                dma_free_coherent(&pdev->dev, 64 * 1024, dev->page_table, dev->page_table_dma);
+            if (dev->desc_ring) {
+                dma_free_coherent(&pdev->dev, 8192 * sizeof(struct xdma_desc), dev->desc_ring, dev->desc_ring_dma_addr);
             }
             dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->ring_buffer, dev->dma_handle);
         } else {

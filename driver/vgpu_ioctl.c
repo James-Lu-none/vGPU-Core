@@ -33,47 +33,50 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                     return dev->num_pinned_pages;
                 }
                 
-                if (uvm_mode == 0) {
-                    /* IOMMU Contiguous Mode */
-                    dev->sgl = kmalloc_array(dev->num_pinned_pages, sizeof(struct scatterlist), GFP_KERNEL);
-                    if (!dev->sgl) return -ENOMEM;
-                    
-                    sg_init_table(dev->sgl, dev->num_pinned_pages);
-                    for (int i = 0; i < dev->num_pinned_pages; i++) {
-                        sg_set_page(&dev->sgl[i], dev->pinned_pages[i], PAGE_SIZE, 0);
-                    }
-                    
-                    dev->sgl_nents = dma_map_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
-                    if (dev->sgl_nents == 0) {
-                        pr_err("vGPU-Core: dma_map_sg failed\n");
-                        kfree(dev->sgl);
-                        return -ENOMEM;
-                    }
-                    
-                    if (dev->sgl_nents != 1) {
-                        pr_err("vGPU-Core: IOMMU failed to coalesce pages into a single chunk. Host lacks IOMMU or it is disabled.\n");
-                        dma_unmap_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
-                        kfree(dev->sgl);
-                        return -ENOTSUPP;
-                    }
-                    
-                    // Write the single contiguous IOVA to the FPGA
-                    dma_addr_t contiguous_iova = sg_dma_address(&dev->sgl[0]);
-                    iowrite32(lower_32_bits(contiguous_iova), dev->mmio_base + VGPU_PAYLOAD_ADDR_LOW_OFFSET);
-                    iowrite32(upper_32_bits(contiguous_iova), dev->mmio_base + VGPU_PAYLOAD_ADDR_HIGH_OFFSET);
-                } else {
-                    /* Scatter-Gather Page Table Mode */
-                    for (int i = 0; i < dev->num_pinned_pages; i++) {
-                        dma_addr_t dma_addr = dma_map_page(&dev->pci_dev->dev, dev->pinned_pages[i], 
-                                                           0, PAGE_SIZE, DMA_BIDIRECTIONAL);
-                        if (dma_mapping_error(&dev->pci_dev->dev, dma_addr)) {
-                            pr_err("vGPU-Core: dma_map_page failed\n");
-                            return -ENOMEM;
-                        }
-                        dev->page_table[i] = dma_addr;
+                /*
+                 * Unified Memory: Scatter-Gather DMA Mapping
+                 * Construct scatterlist and map for DMA.
+                 * Works transparently for both IOMMU and Non-IOMMU hosts.
+                 */
+                dev->sgl = kmalloc_array(dev->num_pinned_pages, sizeof(struct scatterlist), GFP_KERNEL);
+                if (!dev->sgl) return -ENOMEM;
+                
+                sg_init_table(dev->sgl, dev->num_pinned_pages);
+                for (int i = 0; i < dev->num_pinned_pages; i++) {
+                    sg_set_page(&dev->sgl[i], dev->pinned_pages[i], PAGE_SIZE, 0);
+                }
+                
+                dev->sgl_nents = dma_map_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
+                if (dev->sgl_nents == 0) {
+                    pr_err("vGPU-Core: dma_map_sg failed\n");
+                    kfree(dev->sgl);
+                    dev->sgl = NULL;
+                    return -ENOMEM;
+                }
+                
+                /* Build XDMA Descriptor Chain */
+                struct scatterlist *sg;
+                int i;
+                for_each_sg(dev->sgl, sg, dev->sgl_nents, i) {
+                    dev->desc_ring[i].src_addr = sg_dma_address(sg);
+                    dev->desc_ring[i].dst_addr = 0x0;
+                    dev->desc_ring[i].bytes    = sg_dma_len(sg);
+                    dev->desc_ring[i].control  = XDMA_DESC_MAGIC;
+                    // point to the next descriptor in the host
+                    if (i < dev->sgl_nents - 1) {
+                        dev->desc_ring[i].next_desc = dev->desc_ring_dma_addr + (i + 1) * sizeof(struct xdma_desc);
+                    } else {
+                        dev->desc_ring[i].next_desc = 0;
+                        dev->desc_ring[i].control  |= XDMA_DESC_EOP; 
                     }
                 }
-                pr_info("vGPU-Core: Demand Paging: Pinned %d pages and built Page Table\n", dev->num_pinned_pages);
+                
+                // Submit first XDMA Descriptor DMA address to FPGA
+                iowrite32(lower_32_bits(dev->desc_ring_dma_addr), dev->mmio_base + VGPU_PAYLOAD_ADDR_LOW_OFFSET);
+                iowrite32(upper_32_bits(dev->desc_ring_dma_addr), dev->mmio_base + VGPU_PAYLOAD_ADDR_HIGH_OFFSET);
+                
+                pr_info("vGPU-Core: Demand Paging: Pinned %d pages and built %d XDMA descriptors\n", 
+                        dev->num_pinned_pages, dev->sgl_nents);
             }
 
             if (queue_mode == 0) {
@@ -152,16 +155,10 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                  * The FPGA has finished computing. We must unmap the DMA addresses
                  * and put (unpin) the user pages so Linux can manage them again.
                  */
-                if (uvm_mode == 0) {
-                    if (dev->sgl) {
-                        dma_unmap_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
-                        kfree(dev->sgl);
-                        dev->sgl = NULL;
-                    }
-                } else {
-                    for (int i = 0; i < dev->num_pinned_pages; i++) {
-                        dma_unmap_page(&dev->pci_dev->dev, dev->page_table[i], PAGE_SIZE, DMA_BIDIRECTIONAL);
-                    }
+                if (dev->sgl) {
+                    dma_unmap_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
+                    kfree(dev->sgl);
+                    dev->sgl = NULL;
                 }
                 
                 for (int i = 0; i < dev->num_pinned_pages; i++) {

@@ -17,10 +17,9 @@ sequenceDiagram
     end
     
     box rgb(245, 255, 250) FPGA Hardware (Artix-7 XC7A200T)
-    participant AXI_PCIe as AXI PCIe IP (axi_pcie_0)
+    participant XDMA as XDMA IP Subsystem
     participant SmartConnect as AXI SmartConnect
     participant Regs as MMIO Regs (vgpu_axi_lite_regs)
-    participant DMA as DMA Master Engine (vgpu_dma_master)
     participant Core as Compute Core ALU (vgpu_compute_core)
     end
 
@@ -30,7 +29,7 @@ sequenceDiagram
     PCIe-->>PCI: Discover FPGA (Vendor ID: 0x10EE, Device ID: 0x7021)
     Note over PCI, PCIe: PCIe Configuration (BAR0 Sizing & Allocation: 64KB)
     PCI->>PCI: Assign Physical Address space for BAR0
-    PCI->>AXI_PCIe: PCIe Config Write: Write Physical Addr back to BAR0
+    PCI->>XDMA: PCIe Config Write: Write Physical Addr back to BAR0
     
     Driver->>PCI: module_init() -> pci_register_driver()
     PCI->>Driver: Match ID -> vgpu_probe(pdev)
@@ -43,25 +42,15 @@ sequenceDiagram
     Driver->>PCI: request_irq(dev->irq, vgpu_irq_handler)
     
     Driver->>RAM: dma_alloc_coherent() (Allocate Ring Buffer 4KB)
-    RAM-->>Driver: Return Virtual Addr (CPU) & Bus Addr (FPGA dma_handle)
+    RAM-->>Driver: Return Virtual Addr & Bus Addr (dma_handle)
     Note over Driver, Regs: Provide FPGA with Ring Buffer Base Address (64-bit split)
     Driver->>PCIe: iowrite32(lower_32_bits(dma_handle), mmio_base + 0x0C)
     Driver->>PCIe: iowrite32(upper_32_bits(dma_handle), mmio_base + 0x10)
     PCIe->>SmartConnect: Route AXI-Lite Write to vgpu_top
     SmartConnect->>Regs: Latch reg_ring_dma_addr [63:0]
     
-    Note over Driver, Regs: Provide FPGA with UVM Mode & Page Table Base Address
-    Driver->>PCIe: iowrite32(uvm_mode, mmio_base + 0x20)
-    PCIe->>SmartConnect: Route AXI-Lite Write
-    SmartConnect->>Regs: Latch reg_uvm_mode (0 = Direct/IOMMU, 1 = Scatter-Gather)
-
-    alt uvm_mode == 1 (Scatter-Gather)
-        Driver->>RAM: dma_alloc_coherent() (Allocate Software Page Table 64KB)
-        Driver->>PCIe: iowrite32(lower_32_bits(page_table_dma), mmio_base + 0x14)
-        Driver->>PCIe: iowrite32(upper_32_bits(page_table_dma), mmio_base + 0x18)
-        PCIe->>SmartConnect: Route AXI-Lite Write
-        SmartConnect->>Regs: Latch reg_pagetable_dma_addr [63:0]
-    end
+    Driver->>RAM: dma_alloc_coherent() (Allocate XDMA Descriptor Ring 64KB)
+    RAM-->>Driver: Return Virtual Addr & Bus Addr (desc_ring_dma_addr)
     
     Driver->>VFS: cdev_add(), device_create(/dev/vgpu0)
 
@@ -79,26 +68,27 @@ sequenceDiagram
     App->>RAM: malloc(payload_size) (User Space Memory Allocation)
     Note over App: CPU Page Faults occur when App writes to malloc memory (Demand Paging!)
 
-    %% Phase 3: Command Submission & Doorbell (PCIe + AXI)
-    Note over App, Core: [Phase 3] Command Submission & Doorbell Trigger
+    %% Phase 3: Command Submission & XDMA Descriptor Construction
+    Note over App, Core: [Phase 3] Command Submission & XDMA Descriptor Construction
     
     App->>VFS: ioctl(fd, VGPU_IOC_SUBMIT_CMD, &user_cmd)
     VFS->>Driver: vgpu_ioctl()
-    Note over Driver, RAM: Unified Memory Setup (Demand Paging)
+    Note over Driver, RAM: Unified Memory Setup (Demand Paging + XDMA SG Chain)
     Driver->>RAM: get_user_pages_fast(user_vaddr) (Lock/Pin User Pages)
+    Driver->>Driver: dma_map_sg() (Map pinned pages to DMA scatterlist, supports IOMMU & Non-IOMMU)
     
-    alt uvm_mode == 0 (IOMMU Contiguous)
-        Driver->>Driver: dma_map_sg() (Request IOMMU to coalesce pages into single IOVA)
-        Driver->>PCIe: iowrite32(lower_32_bits(contiguous_iova), mmio_base + 0x14)
-        Driver->>PCIe: iowrite32(upper_32_bits(contiguous_iova), mmio_base + 0x18)
-        PCIe->>SmartConnect: Route AXI-Lite Write
-        SmartConnect->>Regs: Latch contiguous payload address into reg_pagetable_dma_addr
-    else uvm_mode == 1 (Scatter-Gather)
-        Driver->>Driver: dma_map_page() (Map each pinned page to DMA address)
-        Driver->>RAM: Write mapped DMA physical addresses into dev->page_table[]
+    loop Construct XDMA Descriptor Chain in dev->desc_ring[]
+        Driver->>RAM: desc[i].src_addr = sg_dma_address, desc[i].next_desc = desc_ring_dma + (i+1)*size
     end
+    Driver->>RAM: Set last descriptor control |= XDMA_DESC_EOP
     
-    Driver->>RAM: Write Command Data to ring->cmds[tail] (16 Bytes: opcode, size, vaddr)
+    Note over Driver, Regs: Submit First Descriptor Address to FPGA
+    Driver->>PCIe: iowrite32(lower_32_bits(desc_ring_dma_addr), mmio_base + 0x14)
+    Driver->>PCIe: iowrite32(upper_32_bits(desc_ring_dma_addr), mmio_base + 0x18)
+    PCIe->>SmartConnect: Route AXI-Lite Write
+    SmartConnect->>Regs: Latch XDMA Descriptor Ring Base Address
+    
+    Driver->>RAM: Write Command Data to ring->cmds[tail] (16 Bytes)
     Note over Driver: CPU Producer: Update Tail with Memory Barrier
     Driver->>RAM: smp_store_release(&ring->tail) (Ensure command committed before tail updates!)
     Driver-->>App: VGPU_IOC_SUBMIT_CMD returns
@@ -108,72 +98,46 @@ sequenceDiagram
     
     Note over Driver: Clear irq_fired = 0 (Prevent Lost Wakeup)
     
-    Note over Driver, PCIe: iowrite32(1, mmio_base + 0x00)
+    Note over Driver, PCIe: iowrite32(1, mmio_base + 0x00) (Doorbell Trigger)
     Driver->>PCIe: Issue Memory Write TLP (Target: BAR0 + 0x00 - Doorbell)
     Driver->>Driver: wait_event_interruptible(&dev->wait_q)
     Note over App, Driver: Thread goes to SLEEP (Context Switch)
 
-    PCIe->>AXI_PCIe: Deliver TLP to FPGA Endpoint
-    AXI_PCIe->>SmartConnect: AXI-Lite Write (Addr: 0x00, Data: 1)
+    PCIe->>XDMA: Deliver TLP to FPGA XDMA Endpoint
+    XDMA->>SmartConnect: AXI-Lite Write (Addr: 0x00, Data: 1)
     SmartConnect->>Regs: Pulse doorbell_pulse = 1
-    Regs->>DMA: Trigger start_doorbell (DMA FSM exits S_IDLE)
+    Regs->>XDMA: Trigger XDMA SG Engine Start
 
-    %% Phase 4: FPGA DMA & Streaming Execution
-    Note over App, Core: [Phase 4] AXI4-Full Command Fetch & Streaming Compute
+    %% Phase 4: XDMA Hardware Descriptor Traversal & Streaming Compute
+    Note over App, Core: [Phase 4] XDMA Descriptor Traversal & Streaming Compute
     
-    Note over DMA, PCIe: FPGA Consumer: Read Command Packet
-    DMA->>AXI_PCIe: AXI Read: ring_base_addr + 8 + head*16 (arlen=1, 2 beats = 16B)
-    AXI_PCIe->>RAM: PCIe Memory Read TLP (Host RAM)
-    RAM-->>AXI_PCIe: Return 128-bit Command Struct
-    AXI_PCIe-->>DMA: Beat 0: opcode [31:0] + payload_size [63:32]
-    Note over DMA: Calculate dynamic payload_burst_len = ceil(size / 8) - 1
-    AXI_PCIe-->>DMA: Beat 1: payload_vaddr [63:0]
+    Note over XDMA, RAM: Fetch First Descriptor from Host RAM
+    XDMA->>RAM: PCIe Memory Read TLP: desc_ring_dma_addr (32 Bytes)
+    RAM-->>XDMA: Return Descriptor 0 (src_addr, bytes, next_desc)
     
-    alt uvm_mode == 1 (Scatter-Gather Page Table)
-        Note over DMA, AXI_PCIe: Page Table Walk (Fetch Physical Page Pointer)
-        DMA->>AXI_PCIe: AXI Read: pt_base_addr + (VPN * 8) (arlen=0, 8B)
-        AXI_PCIe->>RAM: PCIe Memory Read TLP (Page Table Entry)
-        RAM-->>AXI_PCIe: Return 64-bit Physical Page DMA Address
-        AXI_PCIe-->>DMA: m_axi_rdata (Physical Page Base)
-        Note over DMA: Calculate final_payload_addr = Page Base + Page Offset [11:0]
-    else uvm_mode == 0 (IOMMU Contiguous)
-        Note over DMA: Set final_payload_addr = pt_base_addr
-    end
-
-    Note over DMA, Core: Streaming Burst Read & Vector SIMD ALU Pipeline
-    DMA->>AXI_PCIe: AXI Read Burst: final_payload_addr (arlen = payload_burst_len)
-    AXI_PCIe->>RAM: PCIe Memory Read TLP (Payload Data)
-    
-    loop Streaming Read & SIMD Vector Compute (Wire Speed)
-        RAM-->>AXI_PCIe: Payload Data Stream (64-bit / clock)
-        AXI_PCIe-->>DMA: m_axi_rdata (64-bit chunk)
-        DMA->>Core: compute_in_buf <= m_axi_rdata, valid_in <= 1
+    loop Traverse XDMA Descriptor Chain & Stream Data into SIMD ALU
+        XDMA->>RAM: PCIe Memory Read TLP: desc[i].src_addr (Page Payload Data)
+        RAM-->>XDMA: Return Payload Data Stream
+        XDMA->>Core: AXI-Stream: tdata (64-bit), tvalid = 1
         Core->>Core: 1-Cycle SIMD ALU: Vector Add (+1) / Mul (*2)
-        Core-->>DMA: compute_out_buf, valid_out <= 1
-        Note over DMA: Stream Buffer (2KB on-chip BRAM) captures computed results (wire speed)
+        Core-->>XDMA: AXI-Stream: tdata (64-bit), tvalid = 1
+        Note over XDMA: XDMA fetches next descriptor via desc[i].next_desc until EOP flag is reached!
     end
 
     %% Phase 5: In-Place Result Writeback
     Note over App, Core: [Phase 5] In-Place Result Writeback & Head Update
-    DMA->>AXI_PCIe: AXI Write Burst: final_payload_addr (awlen = payload_burst_len)
-    loop Streaming Burst Writeback
-        Note over DMA: Stream computed results out of 2KB BRAM (stream_buf[i])
-        DMA->>AXI_PCIe: m_axi_wdata <= stream_buf[i], wstrb = 0xFF
-        AXI_PCIe->>RAM: PCIe Memory Write TLP (Computed Results In-Place)
-    end
-    AXI_PCIe-->>DMA: m_axi_bvalid (Write Response OK)
+    XDMA->>RAM: PCIe Memory Write TLP (Computed Results In-Place to Host RAM)
+    RAM-->>XDMA: PCIe Write Completion OK
     
-    Note over DMA, RAM: FPGA Consumer: Update Head Pointer
-    DMA->>AXI_PCIe: AXI Write: ring_base_addr (Offset: 0x00, awlen=0, wstrb=0x0F)
-    Note over DMA: Write new head pointer (Protected WSTRB prevents tail corruption!)
-    AXI_PCIe->>RAM: PCIe Memory Write TLP (Update ring->head)
-    AXI_PCIe-->>DMA: m_axi_bvalid (Write Response OK)
+    Note over XDMA, RAM: Update Ring Buffer Head Pointer
+    XDMA->>RAM: PCIe Memory Write TLP (Update ring->head at Offset 0x00)
+    RAM-->>XDMA: PCIe Write Completion OK
 
     %% Phase 6: Interrupt & Wakeup
-    Note over App, Core: [Phase 6] MSI Interrupt & Thread Wakeup
-    DMA->>Regs: Assert task_done_irq = 1
-    Regs->>AXI_PCIe: Assert usr_irq_req / INTX_MSI_Request
-    AXI_PCIe->>PCIe: Issue MSI Memory Write TLP (Vector 0 to CPU APIC)
+    Note over App, Core: [Phase 6] MSI Interrupt, Teardown & Thread Wakeup
+    XDMA->>Regs: Assert task_done_irq = 1
+    Regs->>XDMA: Assert usr_irq_req / MSI Interrupt Request
+    XDMA->>PCIe: Issue MSI Memory Write TLP (Vector 0 to CPU APIC)
     
     PCIe->>PCI: CPU receives MSI Interrupt
     PCI->>Driver: Execute Top-Half: vgpu_irq_handler()
@@ -193,11 +157,7 @@ sequenceDiagram
     
     Note over Driver: Wakes up from wait_event_interruptible
     Note over Driver, RAM: Unified Memory Teardown
-    alt uvm_mode == 0
-        Driver->>Driver: dma_unmap_sg() (Unmap IOVA)
-    else uvm_mode == 1
-        Driver->>Driver: dma_unmap_page() (Unmap Scatter-Gather Pages)
-    end
+    Driver->>Driver: dma_unmap_sg() (Unmap Scatter-Gather DMA Mappings)
     Driver->>RAM: put_page() (Unpin/Release physical pages)
     
     Driver-->>App: ioctl(VGPU_IOC_DOORBELL) returns SUCCESS!

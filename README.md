@@ -13,6 +13,15 @@
 - **[Synchronization]** Kernel Driver 攔截中斷，喚醒在 Wait Queue 中等待的 User space 執行緒
 - **[Result]** User space 被喚醒後從 mmap 的位址讀取運算結果
 
+## Unified Virtual Memory with Zero-Copy Direct DMA via XDMA Scatter-Gather Descriptors
+
+Originally, a fixed DMA buffer was allocated at probe time and mapped to user space via `mmap`. 
+Now, the driver dynamically binds and pins user-space virtual memory on demand (`ioctl`) without pre-allocating contiguous physical RAM during probe:
+
+- On probe: Allocates a 64KB coherent DMA buffer (`dev->desc_ring`) to hold up to 8192 XDMA Descriptors, and a 64KB array (`pinned_pages`) to hold `struct page *` pointers (supporting up to 32MB payload limit).
+- On ioctl: Dynamically pins user-space pages based on `payload_size` using `get_user_pages_fast()`. Then establishes DMA mappings using `dma_map_sg()` (transparently supporting both IOMMU and Non-IOMMU hosts).
+- XDMA Descriptor Chain: Converts the mapped scatterlist (`dev->sgl`) into an XDMA Hardware Descriptor Chain in `dev->desc_ring`, linking non-contiguous physical pages via `next_desc` pointers. The driver submits the first Descriptor's DMA address to the FPGA XDMA IP via MMIO, allowing XDMA to automatically traverse and stream all payload pages.
+
 ## 核心架構與功能 (Core Features & Architecture)
 
 - **Basic Scaffolding & Char Device**: 完成 LKM 註冊、`open`/`release` 機制與基礎 Context 隔離。
