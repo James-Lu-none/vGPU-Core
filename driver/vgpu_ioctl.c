@@ -127,18 +127,21 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             // Then wait_event_interruptible will see the 1 and return immediately (no deadlock)
             if (queue_mode == 0) {
                 dev->irq_fired = 0;
-                // // Streaming DMA: Cache Flush (Clean) (old implementation when using fixed continuous 1M payload buffer)
-                // // Before we tell the FPGA to start computing, we MUST flush any 
-                // // modified payload data from the CPU's L1/L2 cache out to physical RAM.
-                // // If we don't, the FPGA will DMA read stale garbage data from RAM.
-                // if (dma_mode == 1 && dev->payload_buffer) {
-                //    dma_sync_single_for_device(&dev->pci_dev->dev, dev->payload_dma_handle,
-                //                               dev->payload_size, DMA_BIDIRECTIONAL);
-                // }
 
-                // The dma_map_page() call in SUBMIT_CMD implicitly handled Cache Flush for us.
+                /* Build CUDA Task Descriptor for Direct CP Mailbox */
+                struct cuda_task_descriptor task = {};
+                task.magic        = 0x43554441; /* "CUDA" */
+                task.opcode       = user_cmd.opcode;
+                task.grid_dim_x   = 32;
+                task.block_dim_x  = 32;
+                task.num_elements = user_cmd.payload_size / sizeof(u64);
+                if (dev->sgl && dev->sgl_nents > 0) {
+                    task.src_dma_addr = sg_dma_address(&dev->sgl[0]);
+                }
 
-                iowrite32(1, dev->mmio_base + VGPU_DOORBELL_OFFSET);
+                /* Direct PCIe MMIO Write to RISC-V BRAM Mailbox at BAR0 + 0x3F00 */
+                memcpy_toio(dev->mmio_base + VGPU_MAILBOX_OFFSET, &task, sizeof(task));
+
                 wait_event_interruptible(dev->wait_q, dev->irq_fired != 0);
                 
                 // // Streaming DMA: Cache Invalidate (old implementation when using fixed continuous 1M payload buffer)

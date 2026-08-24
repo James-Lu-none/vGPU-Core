@@ -11,24 +11,12 @@
 irqreturn_t vgpu_irq_handler(int irq, void *dev_id)
 {
     struct vgpu_dev *dev = (struct vgpu_dev *)dev_id;
-    u32 status;
 
     /*
-     * Step 1: Read and clear the hardware interrupt status.
-     * We read the Interrupt Status Register (BAR0 + 0x44) to verify if the FPGA 
-     * actually generated this interrupt. If so, we clear it by writing to the 
-     * Acknowledge Register (BAR0 + 0x48).
+     * PCIe Interrupt Received from FPGA (XDMA usr_irq_req)
+     * The hardware compute core has finished execution. Wake up User Space.
      */
-    status = ioread32(dev->mmio_base + VGPU_INT_STATUS_OFFSET);
-    if (!status) {
-        /* Not our interrupt. Return IRQ_NONE to let the kernel know. */
-        return IRQ_NONE; 
-    }
-    
-    // Clear the interrupt on the FPGA side so it doesn't keep firing
-    iowrite32(status, dev->mmio_base + VGPU_INT_ACK_OFFSET);
-
-    pr_info("vGPU-Core: [Hardware] IRQ received on vgpu%d! (status: 0x%x)\n", dev->minor, status);
+    pr_info("vGPU-Core: [Hardware] PCIe IRQ received on vgpu%d!\n", dev->minor);
     
     /*
      * Step 2: Wake up User Space.

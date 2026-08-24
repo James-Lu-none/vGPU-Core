@@ -19,28 +19,31 @@
 #include "../uapi/vgpu_ioctl.h"
 
 /*
- * MMIO Register Offsets
- * These are the offsets within BAR0 that the FPGA exposes.
+ * Direct Host-to-CP Mailbox & Hardware IRQ MMIO Offset (BAR0)
+ * 0x0000 ~ 0x3EFF: RISC-V On-Chip BRAM Code & Data Space
+ * 0x3F00 ~ 0x3FFF: Direct Host-to-CP BRAM Mailbox Window (256-Byte Window)
  * 
- * In a real FPGA design (e.g. using Xilinx XDMA IP), the Address mapping works as follows:
- * 1. CPU writes to (dev->mmio_base + 0x40).
- * 2. This creates a PCIe Memory Write TLP aimed at BAR0 + 0x40.
- * 3. XDMA IP receives the TLP and applies "PCIe-to-AXI Translation", converting it to an 
- *    AXI-Lite transaction with address (AXI_BASE_ADDR + 0x40) on its M_AXI_LITE port.
- * 4. The Vivado AXI Interconnect (configured via Address Editor) routes this transaction
- *    to our custom AXI-Lite Slave IP.
- * 5. Our custom IP decodes the 0x00 offset (slv_reg0) to trigger the hardware state machine (Doorbell).
- * Driver -> PCIe -> XDMA -> AXI Interconnect -> Custom IP
+ * Writing struct cuda_task_descriptor to BAR0 + 0x3F00 automatically 
+ * triggers a 1-cycle hardware interrupt pulse to PicoRV32's irq[0] line
  */
+#define VGPU_MAILBOX_OFFSET       0x3F00 /* Direct BAR0 BRAM Mailbox Offset */
 
-#define VGPU_DOORBELL_OFFSET      0x00 /* slv_reg0: Trigger DMA */
-#define VGPU_INT_STATUS_OFFSET    0x04 /* slv_reg1: Read IRQ status */
-#define VGPU_INT_ACK_OFFSET       0x08 /* slv_reg2: Clear IRQ status */
-#define VGPU_DMA_ADDR_LOW_OFFSET  0x0C /* slv_reg3: DMA Buffer Bus Address (Lower 32-bit) */
-#define VGPU_DMA_ADDR_HIGH_OFFSET 0x10 /* slv_reg4: DMA Buffer Bus Address (Upper 32-bit) */
-#define VGPU_PAYLOAD_ADDR_LOW_OFFSET  0x14 /* slv_reg5: Page Table Base Address (Lower 32-bit) */
-#define VGPU_PAYLOAD_ADDR_HIGH_OFFSET 0x18 /* slv_reg6: Page Table Base Address (Upper 32-bit) */
-#define VGPU_UVM_MODE_OFFSET          0x20 /* slv_reg7: 0=Direct/IOMMU, 1=Scatter-Gather */
+/*
+ * CUDA Task Descriptor Structure (64-byte aligned)
+ * User Space & Driver -> Direct PCIe Write -> RISC-V Command Processor (PicoRV32)
+ */
+struct cuda_task_descriptor {
+    u32 magic;         /* 0x43554441 ("CUDA") */
+    u32 opcode;        /* 1: Add, 2: Mul, 3: Render, 4: SMEM_Write, 5: SMEM_Accumulate */
+    u32 grid_dim_x;    /* Grid Dimension X */
+    u32 grid_dim_y;    /* Grid Dimension Y */
+    u32 block_dim_x;   /* Block Dimension X */
+    u32 block_dim_y;   /* Block Dimension Y */
+    u64 src_dma_addr;  /* Host Input DMA Buffer Address (PCIe Bus Address) */
+    u64 dst_dma_addr;  /* Host Output DMA Buffer Address (PCIe Bus Address) */
+    u32 num_elements;  /* Vector Element Count */
+    u32 reserved[7];   /* Padding to 64 bytes */
+} __packed __aligned(64);
 
 #define QUEUE_SIZE 256
 
