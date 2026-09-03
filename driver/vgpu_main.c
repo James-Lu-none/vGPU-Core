@@ -378,10 +378,9 @@ static void vgpu_remove(struct pci_dev *pdev)
     pci_disable_device(pdev);
 }
 
-// Xilinx Vendor ID is 0x10EE
-// Match any device ID for now, or specify 0x7021 (Artix-7 XDMA)
+// pci device id is configured in XDMA ip in vivado
 static const struct pci_device_id vgpu_pci_id_table[] = {
-    { PCI_DEVICE(0x10EE, PCI_ANY_ID) },
+    { PCI_DEVICE(0x10EE, 0x7021) },
     { 0, }
 };
 MODULE_DEVICE_TABLE(pci, vgpu_pci_id_table);
