@@ -5,9 +5,6 @@ int queue_mode = 0;
 module_param(queue_mode, int, 0644);
 MODULE_PARM_DESC(queue_mode, "0: Global Shared Queue, 1: Private Context Queue");
 
-int dma_mode = 0;
-module_param(dma_mode, int, 0644);
-MODULE_PARM_DESC(dma_mode, "0: Software MMAP, 1: DMA API");
 
 struct class *g_vgpu_class = NULL;
 
@@ -176,6 +173,18 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     }
 
     /*
+     * PCIe Mapping: XDMA Config BAR
+     * BAR1 is the Xilinx XDMA Configuration Space. We use this to program 
+     * the internal DMA engine to transfer payloads to the FPGA DRAM.
+     */
+    dev->xdma_base = pci_ioremap_bar(pdev, 1);
+    if (!dev->xdma_base) {
+        pr_err("vGPU-Core: failed to ioremap BAR1 (XDMA Config)\n");
+        result = -ENOMEM;
+        goto err_iounmap_bar0;
+    }
+
+    /*
      * Retrieve the actual IRQ number assigned to vector 0.
      * This number represents the Linux logical IRQ number mapped to the physical MSI vector.
      */
@@ -199,65 +208,46 @@ static int vgpu_probe(struct pci_dev *pdev, const struct pci_device_id *id)
     init_waitqueue_head(&dev->wait_q);
     dev->irq_fired = 0;
 
-    if (dma_mode == 1) {
-        // see page 376 at https://bootlin.com/doc/training/linux-kernel/linux-kernel-slides.pdf
-        dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
-        
-        dev->ring_buffer = dma_alloc_coherent(&pdev->dev, PAGE_SIZE, 
-                                              &dev->dma_handle, GFP_KERNEL);
-        if (!dev->ring_buffer) {
-            pr_err("vGPU-Core: failed to allocate DMA memory\n");
-            result = -ENOMEM;
-            goto err_iounmap;
-        }
-        pr_info("vGPU-Core: Allocated DMA buffer at %p (bus addr: %llx)\n", 
-                dev->ring_buffer, (unsigned long long)dev->dma_handle);
-                
-        // tell the FPGA where the DMA buffer is located in System RAM.
-        // otherwise, the FPGA's XDMA IP doesn't know where to Read/Write.
-        // we write the 64-bit Bus Address into two 32-bit registers for compatibility with 32-bit DMA address register.
-        // this dma memory is for command queue
-        iowrite32(lower_32_bits(dev->dma_handle), dev->mmio_base + VGPU_DMA_ADDR_LOW_OFFSET);
-        iowrite32(upper_32_bits(dev->dma_handle), dev->mmio_base + VGPU_DMA_ADDR_HIGH_OFFSET);
-        pr_info("vGPU-Core: Configured FPGA Ring Buffer Base Address to 0x%llx\n", (unsigned long long)dev->dma_handle);
-        
-        // Allocate 64KB Coherent DMA memory for XDMA Descriptor Ring (8192 descriptors)
-        // this memory is for storing the descriptor ring that will be sent to FPGA, 
-        // 64KB / 8 bytes = 8192 entries (supports up to 32MB payload)
-        dev->desc_ring = dma_alloc_coherent(&pdev->dev, 8192 * sizeof(struct xdma_desc),
-                                             &dev->desc_ring_dma_addr, GFP_KERNEL);
-        if (!dev->desc_ring) {
-            pr_err("vGPU-Core: failed to allocate XDMA descriptor ring buffer\n");
-            result = -ENOMEM;
-            goto err_mem_pt;
-        }
-
-        pr_info("vGPU-Core: Allocated XDMA Descriptor Ring at %p (bus addr: %llx)\n", 
-                dev->desc_ring, (unsigned long long)dev->desc_ring_dma_addr);
-        
-        // Allocate array for pointers to the pinned pages (8192 entries)
-        dev->pinned_pages = kzalloc(8192 * sizeof(struct page *), GFP_KERNEL);
-        if (!dev->pinned_pages) {
-            pr_err("vGPU-Core: failed to allocate pinned_pages array\n");
-            result = -ENOMEM;
-            goto err_mem_pt;
-        }
-        
-    } else {
-        dev->ring_buffer = (void *)__get_free_pages(GFP_KERNEL, 0);
-        if (!dev->ring_buffer) {
-            pr_err("vGPU-Core: failed to allocate pages\n");
-            result = -ENOMEM;
-            goto err_iounmap;
-        }
-        pr_info("vGPU-Core: Allocated pure software page buffer at %p\n", 
-                dev->ring_buffer);
-        
+    // see page 376 at https://bootlin.com/doc/training/linux-kernel/linux-kernel-slides.pdf
+    dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+    
+    // Note: The Ring Buffer itself is now mapped to FPGA BRAM (BAR0),
+    // so we dont need to allocate Host RAM for the Ring Buffer.
+    // We only allocate Host RAM for the XDMA Descriptor Ring.
+    
+    // Allocate 64KB Coherent DMA memory for XDMA Descriptor Ring (8192 descriptors)
+    // this memory is for storing the descriptor ring that will be sent to FPGA, 
+    // 64KB / 8 bytes = 8192 entries (supports up to 32MB payload)
+    dev->desc_ring = dma_alloc_coherent(&pdev->dev, 8192 * sizeof(struct xdma_desc),
+                                         &dev->desc_ring_dma_addr, GFP_KERNEL);
+    if (!dev->desc_ring) {
+        pr_err("vGPU-Core: failed to allocate XDMA descriptor ring buffer\n");
+        result = -ENOMEM;
+        goto err_mem_pt;
     }
 
-    dev->ring = (struct vgpu_ring_buffer *)dev->ring_buffer;
-    dev->ring->head = 0;
-    dev->ring->tail = 0;
+    pr_info("vGPU-Core: Allocated XDMA Descriptor Ring at %p (bus addr: %llx)\n", 
+            dev->desc_ring, (unsigned long long)dev->desc_ring_dma_addr);
+    
+    // Allocate array for pointers to the pinned pages (8192 entries)
+    dev->pinned_pages = kzalloc(8192 * sizeof(struct page *), GFP_KERNEL);
+    if (!dev->pinned_pages) {
+        pr_err("vGPU-Core: failed to allocate pinned_pages array\n");
+        result = -ENOMEM;
+        goto err_mem_pt;
+    }
+
+    /*
+     * Ring Buffer Initialization
+     * We map the software 'ring' structure directly over the PCIe BAR0 memory space.
+     * When the Host CPU updates dev->ring->tail, it's actually sending a PCIe MMIO Write 
+     * directly into the FPGA BRAM.
+     */
+    dev->ring = (struct vgpu_ring_buffer *)(dev->mmio_base + VGPU_RING_OFFSET);
+    // Note: Do not initialize head/tail to 0 here if the firmware has already started, 
+    // but since we are probing, we reset them.
+    iowrite32(0, &dev->ring->head);
+    iowrite32(0, &dev->ring->tail);
 
     /*
      * IRQ Registration: request_irq()
@@ -307,18 +297,13 @@ err_cdev:
 err_irq:
     free_irq(dev->irq, dev);
 err_mem_pt:
-    if (dma_mode == 1) {
-        if (dev->pinned_pages) kfree(dev->pinned_pages);
-        if (dev->desc_ring) dma_free_coherent(&pdev->dev, 8192 * sizeof(struct xdma_desc), dev->desc_ring, dev->desc_ring_dma_addr);
-    }
+    if (dev->pinned_pages) kfree(dev->pinned_pages);
+    if (dev->desc_ring) dma_free_coherent(&pdev->dev, 8192 * sizeof(struct xdma_desc), dev->desc_ring, dev->desc_ring_dma_addr);
 err_mem:
-    if (dma_mode == 1) {
-        if (dev->ring_buffer) dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->ring_buffer, dev->dma_handle);
-    } else {
-        free_pages((unsigned long)dev->ring_buffer, 0);
-    }
 err_iounmap:
-    pci_iounmap(pdev, dev->mmio_base);
+    if (dev->xdma_base) pci_iounmap(pdev, dev->xdma_base);
+err_iounmap_bar0:
+    if (dev->mmio_base) pci_iounmap(pdev, dev->mmio_base);
 err_free:
     kfree(dev);
 err_regions:
@@ -341,19 +326,13 @@ static void vgpu_remove(struct pci_dev *pdev)
         device_destroy(g_vgpu_class, MKDEV(MAJOR(vgpu_dev_num), dev->minor));
         cdev_del(&dev->cdev);
 
-        if (dma_mode == 1) {
-            kfree(dev->pinned_pages);
-            if (dev->desc_ring) {
-                dma_free_coherent(&pdev->dev, 8192 * sizeof(struct xdma_desc), dev->desc_ring, dev->desc_ring_dma_addr);
-            }
-            dma_free_coherent(&pdev->dev, PAGE_SIZE, dev->ring_buffer, dev->dma_handle);
-        } else {
-            free_pages((unsigned long)dev->ring_buffer, 0);
+        kfree(dev->pinned_pages);
+        if (dev->desc_ring) {
+            dma_free_coherent(&pdev->dev, 8192 * sizeof(struct xdma_desc), dev->desc_ring, dev->desc_ring_dma_addr);
         }
 
-        if (dev->mmio_base) {
-            pci_iounmap(pdev, dev->mmio_base);
-        }
+        if (dev->xdma_base) pci_iounmap(pdev, dev->xdma_base);
+        if (dev->mmio_base) pci_iounmap(pdev, dev->mmio_base);
 
         if (dev->irq) {
             /*

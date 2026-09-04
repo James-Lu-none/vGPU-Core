@@ -28,6 +28,19 @@
  */
 #define VGPU_MAILBOX_OFFSET       0x3F00 /* Direct BAR0 BRAM Mailbox Offset */
 
+#define VGPU_RING_OFFSET          0x3E00 /* Direct BAR0 BRAM Ring Buffer Offset */
+
+/*
+ * XDMA Hardware Engine Control Registers (Mapped to BAR1)
+ * These registers are used to program the Xilinx XDMA IP's internal DMA engine.
+ * We use them to initiate a Host-to-Card (H2C) DMA transfer from Host RAM to FPGA DRAM.
+ * Why do we need this? Because copying large payloads (like images/matrices) via
+ * MMIO (CPU writes) is extremely slow. DMA offloads this to hardware.
+ */
+#define XDMA_H2C_CHAN0_CTRL   0x0004 // H2C Channel 0 Control Register (Write 1 to Run)
+#define XDMA_H2C_CHAN0_SG_LO  0x0080 // H2C Channel 0 Scatter-Gather First Descriptor Address Low (32-bit)
+#define XDMA_H2C_CHAN0_SG_HI  0x0084 // H2C Channel 0 Scatter-Gather First Descriptor Address High (32-bit)
+
 /*
  * CUDA Task Descriptor Structure (64-byte aligned)
  * User Space & Driver -> Direct PCIe Write -> RISC-V Command Processor (PicoRV32)
@@ -45,22 +58,24 @@ struct cuda_task_descriptor {
     u32 reserved[7];   /* Padding to 64 bytes */
 } __packed __aligned(64);
 
-#define QUEUE_SIZE 256
+#define QUEUE_SIZE 4 // Reduced to 4 to fit inside the 256-Byte BRAM Mailbox region
 
 /*
- * Lock-Free Ring Buffer (Shared between CPU and FPGA)
- * This structure is mapped directly into the DMA buffer.
- * - CPU (Producer): Writes to cmds[tail], then uses smp_store_release(&tail).
- * - FPGA (Consumer): Reads cmds[head], processes, then DMA writes to 'head'.
+ * Lock-Free Ring Buffer (Now mapped directly into FPGA BRAM via BAR0)
+ * Why place it in BRAM instead of Host RAM? 
+ * Because the PicoRV32 (FPGA Firmware) does not have an AXI Master to initiate 
+ * PCIe reads from Host RAM. By placing the Ring Buffer in BRAM, both Host CPU 
+ * and PicoRV32 can access it easily (Host via PCIe MMIO, PicoRV32 via local AXI).
+ * This enables an asynchronous architecture where Host pushes multiple tasks 
+ * without waiting, and FPGA fetches them without blocking.
  */
 struct vgpu_ring_buffer {
-    volatile u32 head; /* Updated by FPGA via DMA Write */
-    volatile u32 tail; /* Updated by CPU (Host) */
-    struct vgpu_command cmds[QUEUE_SIZE];
+    volatile u32 head; /* Updated by FPGA (Consumer) */
+    volatile u32 tail; /* Updated by CPU Host (Producer) */
+    struct cuda_task_descriptor cmds[QUEUE_SIZE];
 };
 
 extern int queue_mode;
-extern int dma_mode;
 
 struct vgpu_context {
     // for one vgpu, each open context only needs the private queue
@@ -93,7 +108,8 @@ struct vgpu_dev {
     struct cdev cdev;
     struct device *device;
     struct pci_dev *pci_dev;
-    void __iomem *mmio_base; // Mapped PCIe Base Address Register 0 (BAR0) address
+    void __iomem *mmio_base; // Mapped PCIe BAR0 (AXI-Lite to BRAM & GPU Engine)
+    void __iomem *xdma_base; // Mapped PCIe BAR1 (XDMA Config Registers)
     int irq;                 // The IRQ number allocated by the PCI subsystem for this device
 
     struct vgpu_ring_buffer *ring; // Points to ring_buffer (used as global queue)

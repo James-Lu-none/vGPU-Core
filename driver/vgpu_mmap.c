@@ -16,14 +16,9 @@ int vgpu_mmap(struct file *file, struct vm_area_struct *vma)
          */
         if (size > PAGE_SIZE) return -EINVAL;
 
-        if (dma_mode == 1) {
-            return dma_mmap_coherent(&dev->pci_dev->dev, vma, 
-                                     dev->ring_buffer, 
-                                     dev->dma_handle, size);
-        } else {
-            pfn = virt_to_phys(dev->ring_buffer) >> PAGE_SHIFT;
-            return remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
-        }
+        return dma_mmap_coherent(&dev->pci_dev->dev, vma, 
+                                    dev->ring_buffer, 
+                                    dev->dma_handle, size);
     }
 
     return -EINVAL;

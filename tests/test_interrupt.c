@@ -24,9 +24,8 @@ int main(int argc, char **argv) {
 
     struct vgpu_command cmd = {
         .opcode = 1,
-        .operand1 = 100,
-        .operand2 = 200,
-        .result = 0
+        .payload_size = 0,
+        .payload_vaddr = 0,
     };
     unsigned long cmd_ptr = (unsigned long)&cmd;
 

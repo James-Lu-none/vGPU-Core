@@ -22,9 +22,8 @@ void *worker_thread(void *arg) {
 
     struct vgpu_command cmd = {
         .opcode = 1,
-        .operand1 = thread_id,
-        .operand2 = 1,
-        .result = 0
+        .payload_size = 0,
+        .payload_vaddr = 0,
     };
     unsigned long cmd_ptr = (unsigned long)&cmd;
 

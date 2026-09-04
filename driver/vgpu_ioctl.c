@@ -18,10 +18,8 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             if (user_cmd.payload_size > 0 && user_cmd.payload_vaddr != 0) {
                 /*
                  * Unified Memory: Demand Paging (Software Page Table)
-                 * 1. Calculate how many 4KB pages we need.
-                 * 2. Call get_user_pages_fast() to trigger Linux Demand Paging.
-                 *    If the pages aren't physically allocated yet, Linux will allocate them now.
-                 * 3. Lock/Pin these pages in physical RAM so they don't get swapped out.
+                 * We use get_user_pages_fast to pin the User Space virtual memory pages
+                 * into physical RAM, ensuring they aren't swapped out during DMA.
                  */
                 int num_pages = (user_cmd.payload_size + PAGE_SIZE - 1) / PAGE_SIZE;
                 if (num_pages > 8192) return -EINVAL; // Max 32MB for our demo
@@ -34,9 +32,8 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 }
                 
                 /*
-                 * Unified Memory: Scatter-Gather DMA Mapping
-                 * Construct scatterlist and map for DMA.
-                 * Works transparently for both IOMMU and Non-IOMMU hosts.
+                 * Scatter-Gather DMA Mapping
+                 * We map the pinned pages for DMA, obtaining physical bus addresses.
                  */
                 dev->sgl = kmalloc_array(dev->num_pinned_pages, sizeof(struct scatterlist), GFP_KERNEL);
                 if (!dev->sgl) return -ENOMEM;
@@ -54,7 +51,10 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                     return -ENOMEM;
                 }
                 
-                /* Build XDMA Descriptor Chain */
+                /* 
+                 * Build XDMA Descriptor Chain
+                 * We construct the Scatter-Gather descriptors exactly as the Xilinx XDMA IP expects.
+                 */
                 struct scatterlist *sg;
                 int i;
                 for_each_sg(dev->sgl, sg, dev->sgl_nents, i) {
@@ -71,12 +71,38 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                     }
                 }
                 
-                // Submit first XDMA Descriptor DMA address to FPGA
-                iowrite32(lower_32_bits(dev->desc_ring_dma_addr), dev->mmio_base + VGPU_PAYLOAD_ADDR_LOW_OFFSET);
-                iowrite32(upper_32_bits(dev->desc_ring_dma_addr), dev->mmio_base + VGPU_PAYLOAD_ADDR_HIGH_OFFSET);
+                /*
+                 * Start XDMA Host-to-Card (H2C) Transfer
+                 * We write the address of our descriptor ring to the XDMA Config BAR (BAR1).
+                 * This initiates the DMA engine on the FPGA, pulling data from Host RAM to FPGA DRAM.
+                 */
+                iowrite32(lower_32_bits(dev->desc_ring_dma_addr), dev->xdma_base + XDMA_H2C_CHAN0_SG_LO);
+                iowrite32(upper_32_bits(dev->desc_ring_dma_addr), dev->xdma_base + XDMA_H2C_CHAN0_SG_HI);
+                iowrite32(1, dev->xdma_base + XDMA_H2C_CHAN0_CTRL); // 1 = Run
                 
-                pr_info("vGPU-Core: Demand Paging: Pinned %d pages and built %d XDMA descriptors\n", 
-                        dev->num_pinned_pages, dev->sgl_nents);
+                // For simplicity in this demo, we wait for XDMA to finish synchronously.
+                // In a production environment, this should be interrupt-driven.
+                // Status register is at 0x0040. Bit 0 is Busy.
+                while ((ioread32(dev->xdma_base + 0x0040) & 1) != 0) {
+                    cpu_relax();
+                }
+                iowrite32(0, dev->xdma_base + XDMA_H2C_CHAN0_CTRL); // Stop
+                
+                /*
+                 * Unified Memory: Teardown
+                 * Since the XDMA has successfully copied the data into the FPGA's DRAM,
+                 * we no longer need to keep the Host pages pinned! We can unmap them immediately.
+                 * This is a massive advantage: User Space memory isn't locked while the GPU computes.
+                 */
+                if (dev->sgl) {
+                    dma_unmap_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
+                    kfree(dev->sgl);
+                    dev->sgl = NULL;
+                }
+                for (int j = 0; j < dev->num_pinned_pages; j++) {
+                    put_page(dev->pinned_pages[j]);
+                }
+                dev->num_pinned_pages = 0;
             }
 
             if (queue_mode == 0) {
@@ -85,97 +111,68 @@ long vgpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 // Protect multiple CPU producer threads from stepping on each other
                 spin_lock(&dev->global_lock);
                 
-                // Lock-Free Memory Barrier: smp_load_acquire()
-                // Guarantees that we read the most up-to-date 'head' updated by the FPGA DMA.
-                // Any memory operations after this will not be reordered before it.
-                head = smp_load_acquire(&dev->ring->head);
-                tail = dev->ring->tail;
+                // Read head/tail from FPGA BRAM (BAR0)
+                head = ioread32(&dev->ring->head);
+                tail = ioread32(&dev->ring->tail);
                 
                 if ((tail + 1) % QUEUE_SIZE == head) {
                     spin_unlock(&dev->global_lock);
                     return -EBUSY; // Queue Full
                 }
                 
-                // Write the command data into the DMA-mapped Ring Buffer
-                dev->ring->cmds[tail] = user_cmd;
-                
-                // Lock-Free Memory Barrier: smp_store_release()
-                // CRITICAL: Ensures that the user_cmd is completely committed to System RAM 
-                // BEFORE we update the tail pointer. If the CPU out-of-order execution writes 
-                // the tail first, the FPGA might fetch garbage data!
-                smp_store_release(&dev->ring->tail, (tail + 1) % QUEUE_SIZE);
-                
-                spin_unlock(&dev->global_lock);
-            } else {
-                // 原本一個 context 所有的資訊都在 kernel space 的記憶體裡
-                // 但在改成有實體 gpu 跟 dma 之後，每個 process (context) 除了原本 ctx 以外
-                // 還需要一個獨立的 dma_alloc_coherent 拿來放 command ring buffer
-                // 然後讓 hardware 端做硬體切換 context 的功能
-                // 才能實現多租戶 lock free 的功能
-                // ctx->private_queue[ctx->tail] = user_cmd;
-                // ctx->tail = (ctx->tail + 1) % QUEUE_SIZE;
-                pr_err("vGPU-Core: Private queue mode currently unmapped to DMA\n");
-                return -ENOTSUPP;
-            }
-            break;
-
-        case VGPU_IOC_DOORBELL:
-            pr_info("vGPU-Core: [Atomic Submit & Wait] Ringing doorbell for vgpu%d...\n", dev->minor);
-
-            // Clear irq_fired BEFORE ringing the doorbell to prevent Lost Wakeup.
-            // If the FPGA fires the IRQ instantly, it will set dev->irq_fired = 1.
-            // Then wait_event_interruptible will see the 1 and return immediately (no deadlock)
-            if (queue_mode == 0) {
-                dev->irq_fired = 0;
-
-                /* Build CUDA Task Descriptor for Direct CP Mailbox */
+                /* 
+                 * Build Hardware Task Descriptor
+                 * This is the payload the PicoRV32 firmware actually understands.
+                 */
                 struct cuda_task_descriptor task = {};
                 task.magic        = 0x43554441; /* "CUDA" */
                 task.opcode       = user_cmd.opcode;
                 task.grid_dim_x   = 32;
                 task.block_dim_x  = 32;
                 task.num_elements = user_cmd.payload_size / sizeof(u64);
-                if (dev->sgl && dev->sgl_nents > 0) {
-                    task.src_dma_addr = sg_dma_address(&dev->sgl[0]);
-                }
-
-                /* Direct PCIe MMIO Write to RISC-V BRAM Mailbox at BAR0 + 0x3F00 */
-                memcpy_toio(dev->mmio_base + VGPU_MAILBOX_OFFSET, &task, sizeof(task));
-
-                wait_event_interruptible(dev->wait_q, dev->irq_fired != 0);
                 
-                // // Streaming DMA: Cache Invalidate (old implementation when using fixed continuous 1M payload buffer)
-                // // The FPGA has finished computing and DMA-written the results to RAM.
-                // // We MUST invalidate the CPU's cache for this region, forcing the CPU 
-                // // to fetch the fresh results from RAM instead of reading stale cache lines.
-                // if (dma_mode == 1 && dev->payload_buffer) {
-                //     dma_sync_single_for_cpu(&dev->pci_dev->dev, dev->payload_dma_handle,
-                //                             dev->payload_size, DMA_BIDIRECTIONAL);
-                // }
+                // Because XDMA already copied the data to FPGA DRAM Address 0x0,
+                // we tell the GPU Engine to fetch from Address 0x0 (Local memory), not Host memory!
+                task.src_dma_addr = 0x0;
 
-                /*
-                 * Unified Memory: Teardown
-                 * The FPGA has finished computing. We must unmap the DMA addresses
-                 * and put (unpin) the user pages so Linux can manage them again.
-                 */
-                if (dev->sgl) {
-                    dma_unmap_sg(&dev->pci_dev->dev, dev->sgl, dev->num_pinned_pages, DMA_BIDIRECTIONAL);
-                    kfree(dev->sgl);
-                    dev->sgl = NULL;
-                }
+                // Write the task directly into the BRAM Ring Buffer
+                memcpy_toio(&dev->ring->cmds[tail], &task, sizeof(task));
                 
-                for (int i = 0; i < dev->num_pinned_pages; i++) {
-                    put_page(dev->pinned_pages[i]);
-                }
-                pr_info("vGPU-Core: Unified Memory: Unmapped and unpinned %d pages\n", dev->num_pinned_pages);
-                dev->num_pinned_pages = 0;
-
-                pr_info("vGPU-Core: [Global Queue] Process woken up by IRQ!\n");
+                // Update tail pointer in BRAM.
+                // The PicoRV32 Firmware (polling the tail pointer) will notice this 
+                // and fetch the task automatically. No explicit Doorbell needed!
+                iowrite32((tail + 1) % QUEUE_SIZE, &dev->ring->tail);
+                
+                spin_unlock(&dev->global_lock);
             } else {
-                ctx->irq_fired = 0;
-                iowrite32(1, dev->mmio_base + VGPU_DOORBELL_OFFSET);
-                wait_event_interruptible(ctx->wait_q, ctx->irq_fired != 0);
-                pr_info("vGPU-Core: [Private Queue] Process woken up by IRQ!\n");
+                pr_err("vGPU-Core: Private queue mode currently unsupported\n");
+                return -ENOTSUPP;
+            }
+            break;
+
+        case VGPU_IOC_DOORBELL:
+            /*
+             * VGPU_IOC_DOORBELL is repurposed as a "Wait for Completion" signal.
+             * Instead of relying on a hardware IRQ (which historically required the PicoRV32 
+             * to crash/trap to signal the host), we simply poll the 'head' pointer in BRAM.
+             * When head == tail, it means the GPU has finished all tasks in the queue.
+             */
+            pr_info("vGPU-Core: Waiting for GPU to finish all tasks in queue...\n");
+
+            if (queue_mode == 0) {
+                u32 tail = ioread32(&dev->ring->tail);
+                
+                // Poll the head pointer updated by PicoRV32
+                while (ioread32(&dev->ring->head) != tail) {
+                    // In a production driver, we would use a timeout or yield the CPU here
+                    // to prevent locking up the system if the GPU hangs.
+                    schedule(); // Yield CPU to other tasks while waiting
+                }
+                
+                pr_info("vGPU-Core: All GPU tasks completed successfully!\n");
+            } else {
+                pr_err("vGPU-Core: Private queue mode currently unsupported\n");
+                return -ENOTSUPP;
             }
             break;
 
