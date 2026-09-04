@@ -1,4 +1,4 @@
-# vGPU-Core: Virtual PCIe GPU/Accelerator Linux Driver
+# PCIe FPGA GPU Liux Driver
 
 ## 運作模式
 
@@ -38,24 +38,57 @@ make
 
 # global queue + spin_lock vs private queue per context
 sudo rmmod vgpu_core
-sudo insmod driver/vgpu_core.ko queue_mode=0 dma_mode=0
+sudo insmod driver/vgpu_core.ko queue_mode=0
 sudo ./tests/test_ioctl
 
 sudo rmmod vgpu_core
-sudo insmod driver/vgpu_core.ko queue_mode=1 dma_mode=0
+sudo insmod driver/vgpu_core.ko queue_mode=1
 sudo ./tests/test_ioctl
-
-# remap_pfn_range vs dma
-sudo rmmod vgpu_core
-sudo insmod driver/vgpu_core.ko queue_mode=1 dma_mode=0
-sudo ./tests/test_mmap
-
-sudo rmmod vgpu_core
-sudo insmod driver/vgpu_core.ko queue_mode=1 dma_mode=1
-sudo ./tests/test_mmap
 
 # test working queue & interrupt
 sudo rmmod vgpu_core
-sudo insmod driver/vgpu_core.ko queue_mode=1 dma_mode=1
+sudo insmod driver/vgpu_core.ko queue_mode=1
 sudo ./tests/test_interrupt
+```
+
+## 
+
+```bash
+user@bastion:~/workspace$ sudo lspci -vvv -nn -d 10ee:7021
+00:10.0 Serial controller [0700]: Xilinx Corporation Device [10ee:7021] (prog-if 01 [16450])
+        Subsystem: Xilinx Corporation Device [10ee:0007]
+        Physical Slot: 16
+        Control: I/O+ Mem+ BusMaster- SpecCycle- MemWINV- VGASnoop- ParErr- Stepping- SERR+ FastB2B- DisINTx-
+        Status: Cap+ 66MHz- UDF- FastB2B- ParErr- DEVSEL=fast >TAbort- <TAbort- <MAbort- >SERR- <PERR- INTx-
+        Interrupt: pin A routed to IRQ 11
+        Region 0: Memory at fea50000 (32-bit, non-prefetchable) [size=64K]
+        Region 1: Memory at fea60000 (32-bit, non-prefetchable) [size=64K]
+        Capabilities: [40] Power Management version 3
+                Flags: PMEClk- DSI- D1- D2- AuxCurrent=0mA PME(D0-,D1-,D2-,D3hot-,D3cold-)
+                Status: D0 NoSoftRst+ PME-Enable- DSel=0 DScale=0 PME-
+        Capabilities: [48] MSI: Enable- Count=1/1 Maskable- 64bit+
+                Address: 0000000000000000  Data: 0000
+        Capabilities: [60] Express (v2) Endpoint, MSI 00
+                DevCap: MaxPayload 512 bytes, PhantFunc 0, Latency L0s <64ns, L1 unlimited
+                        ExtTag+ AttnBtn- AttnInd- PwrInd- RBE+ FLReset- SlotPowerLimit 75W
+                DevCtl: CorrErr- NonFatalErr- FatalErr- UnsupReq-
+                        RlxdOrd+ ExtTag+ PhantFunc- AuxPwr- NoSnoop+
+                        MaxPayload 256 bytes, MaxReadReq 512 bytes
+                DevSta: CorrErr+ NonFatalErr- FatalErr- UnsupReq- AuxPwr- TransPend-
+                LnkCap: Port #0, Speed 5GT/s, Width x1, ASPM L0s, Exit Latency L0s unlimited
+                        ClockPM- Surprise- LLActRep- BwNot- ASPMOptComp-
+                LnkCtl: ASPM Disabled; RCB 64 bytes, Disabled- CommClk+
+                        ExtSynch- ClockPM- AutWidDis- BWInt- AutBWInt-
+                LnkSta: Speed 5GT/s, Width x1
+                        TrErr- Train- SlotClk+ DLActive- BWMgmt- ABWMgmt-
+                DevCap2: Completion Timeout: Range B, TimeoutDis- NROPrPrP- LTR-
+                         10BitTagComp- 10BitTagReq- OBFF Not Supported, ExtFmt- EETLPPrefix-
+                         EmergencyPowerReduction Not Supported, EmergencyPowerReductionInit-
+                         FRS- TPHComp- ExtTPHComp-
+                         AtomicOpsCap: 32bit- 64bit- 128bitCAS-
+                DevCtl2: Completion Timeout: 50us to 50ms, TimeoutDis- LTR- 10BitTagReq- OBFF Disabled,
+                         AtomicOpsCtl: ReqEn-
+                LnkSta2: Current De-emphasis Level: -6dB, EqualizationComplete- EqualizationPhase1-
+                         EqualizationPhase2- EqualizationPhase3- LinkEqualizationRequest-
+                         Retimer- 2Retimers- CrosslinkRes: unsupported
 ```
