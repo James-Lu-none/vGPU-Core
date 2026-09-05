@@ -18,17 +18,8 @@
 #include <linux/scatterlist.h>
 #include "../uapi/vgpu_ioctl.h"
 
-/*
- * Direct Host-to-CP Mailbox & Hardware IRQ MMIO Offset (BAR0)
- * 0x0000 ~ 0x3EFF: RISC-V On-Chip BRAM Code & Data Space
- * 0x3F00 ~ 0x3FFF: Direct Host-to-CP BRAM Mailbox Window (256-Byte Window)
- * 
- * Writing struct cuda_task_descriptor to BAR0 + 0x3F00 automatically 
- * triggers a 1-cycle hardware interrupt pulse to PicoRV32's irq[0] line
- */
-#define VGPU_MAILBOX_OFFSET       0x3F00 /* Direct BAR0 BRAM Mailbox Offset */
-
-#define VGPU_RING_OFFSET          0x3E00 /* Direct BAR0 BRAM Ring Buffer Offset */
+#define VGPU_RING_OFFSET 0x0001_8000 // Direct BAR0 BRAM Ring Buffer Offset (about 32KB)
+#define QUEUE_SIZE 512 // size of cuda_task_descriptor is 64 bytes, 32KB/64 = 512
 
 /*
  * XDMA Hardware Engine Control Registers (Mapped to BAR1)
@@ -55,10 +46,8 @@ struct cuda_task_descriptor {
     u64 src_dma_addr;  /* Host Input DMA Buffer Address (PCIe Bus Address) */
     u64 dst_dma_addr;  /* Host Output DMA Buffer Address (PCIe Bus Address) */
     u32 num_elements;  /* Vector Element Count */
-    u32 reserved[7];   /* Padding to 64 bytes */
+    u32 reserved[5];   /* Padding to 64 bytes */
 } __packed __aligned(64);
-
-#define QUEUE_SIZE 4 // Reduced to 4 to fit inside the 256-Byte BRAM Mailbox region
 
 /*
  * Lock-Free Ring Buffer (Now mapped directly into FPGA BRAM via BAR0)
